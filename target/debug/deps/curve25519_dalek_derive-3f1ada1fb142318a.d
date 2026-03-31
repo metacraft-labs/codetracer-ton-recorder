@@ -1,6 +1,0 @@
-/home/zahary/metacraft/codetracer-ton-recorder/target/debug/deps/curve25519_dalek_derive-3f1ada1fb142318a.d: /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/curve25519-dalek-derive-0.1.1/src/lib.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/curve25519-dalek-derive-0.1.1/src/../README.md
-
-/home/zahary/metacraft/codetracer-ton-recorder/target/debug/deps/libcurve25519_dalek_derive-3f1ada1fb142318a.so: /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/curve25519-dalek-derive-0.1.1/src/lib.rs /home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/curve25519-dalek-derive-0.1.1/src/../README.md
-
-/home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/curve25519-dalek-derive-0.1.1/src/lib.rs:
-/home/zahary/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/curve25519-dalek-derive-0.1.1/src/../README.md:
