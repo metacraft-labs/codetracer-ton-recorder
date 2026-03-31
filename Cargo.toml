@@ -1,0 +1,23 @@
+[package]
+name = "codetracer-ton-recorder"
+version = "0.1.0"
+edition = "2021"
+authors = ["Metacraft Labs Ltd"]
+description = "CodeTracer recorder for Tolk/TON smart contract programs"
+license = "Apache-2.0"
+
+[[bin]]
+name = "codetracer-ton-recorder"
+path = "src/main.rs"
+
+[dependencies]
+codetracer_trace_types = "0.16"
+codetracer_trace_writer = "0.17"
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tycho-vm = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
