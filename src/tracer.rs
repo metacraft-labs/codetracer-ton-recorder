@@ -284,12 +284,12 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
         let line_num = (i + 1) as u32;
 
         // Check for function definition: `fun <name>(...)`
-        if !trimmed.starts_with("fun ") {
+        let after_keyword = if let Some(rest) = trimmed.strip_prefix("fun ") {
+            rest
+        } else {
             i += 1;
             continue;
-        }
-
-        let after_keyword = &trimmed[4..];
+        };
 
         // Parse function name.
         let name_end = after_keyword.find('(').unwrap_or(after_keyword.len());
@@ -418,8 +418,7 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
     let trimmed = line.trim();
 
     // var/val binding: `var <name>: <type> = <expr>;` or `val <name>: <type> = <expr>;`
-    if trimmed.starts_with("var ") || trimmed.starts_with("val ") {
-        let after_keyword = &trimmed[4..];
+    if let Some(after_keyword) = trimmed.strip_prefix("var ").or_else(|| trimmed.strip_prefix("val ")) {
         if let Some(colon_pos) = after_keyword.find(':') {
             let name = after_keyword[..colon_pos].trim().to_string();
             let after_colon = &after_keyword[colon_pos + 1..];
@@ -443,8 +442,8 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
     }
 
     // return statement: `return <expr>;`
-    if trimmed.starts_with("return ") {
-        let expr = trimmed[7..].trim().trim_end_matches(';').trim().to_string();
+    if let Some(rest) = trimmed.strip_prefix("return ") {
+        let expr = rest.trim().trim_end_matches(';').trim().to_string();
         if !expr.is_empty() {
             return Some(Statement::Return {
                 expr,
@@ -460,8 +459,8 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
 /// Returns the function name if so.
 fn parse_function_call(expr: &str) -> Option<String> {
     let expr = expr.trim();
-    if expr.ends_with("()") {
-        let name = expr[..expr.len() - 2].trim();
+    if let Some(name) = expr.strip_suffix("()") {
+        let name = name.trim();
         if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Some(name.to_string());
         }
