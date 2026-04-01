@@ -418,7 +418,10 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
     let trimmed = line.trim();
 
     // var/val binding: `var <name>: <type> = <expr>;` or `val <name>: <type> = <expr>;`
-    if let Some(after_keyword) = trimmed.strip_prefix("var ").or_else(|| trimmed.strip_prefix("val ")) {
+    if let Some(after_keyword) = trimmed
+        .strip_prefix("var ")
+        .or_else(|| trimmed.strip_prefix("val "))
+    {
         if let Some(colon_pos) = after_keyword.find(':') {
             let name = after_keyword[..colon_pos].trim().to_string();
             let after_colon = &after_keyword[colon_pos + 1..];
