@@ -10,8 +10,8 @@ use std::path::Path;
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord};
 use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
-use eyre::{Context, Result, eyre};
+use codetracer_trace_writer::{create_trace_writer, TraceEventsFileFormat};
+use eyre::{eyre, Context, Result};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -251,8 +251,7 @@ pub fn trace_sandbox(
         .map_err(|e| eyre!("{e}"))?;
     TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
         .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path)
-        .map_err(|e| eyre!("{e}"))?;
+    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).map_err(|e| eyre!("{e}"))?;
 
     TraceWriter::start(&mut *writer, source_path, Line(1));
 
@@ -260,12 +259,7 @@ pub fn trace_sandbox(
     let int_type_id = TraceWriter::ensure_type_id(&mut *writer, TypeKind::Int, "int");
 
     // Emit a step + variable events for each instruction.
-    let fn_id = TraceWriter::ensure_function_id(
-        &mut *writer,
-        "<sandbox>",
-        source_path,
-        Line(1),
-    );
+    let fn_id = TraceWriter::ensure_function_id(&mut *writer, "<sandbox>", source_path, Line(1));
     TraceWriter::register_call(&mut *writer, fn_id, vec![]);
 
     for event in &events {
@@ -279,11 +273,7 @@ pub fn trace_sandbox(
                     i: val,
                     type_id: int_type_id,
                 };
-                TraceWriter::register_variable_with_full_value(
-                    &mut *writer,
-                    "tos",
-                    value,
-                );
+                TraceWriter::register_variable_with_full_value(&mut *writer, "tos", value);
             }
         }
     }
@@ -456,10 +446,10 @@ stack: []
 
     #[test]
     fn test_parse_mock_vm_log_fixture() {
-        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("test-programs/tolk/mock_vm_log.txt");
-        let log_text = std::fs::read_to_string(&fixture_path)
-            .expect("mock_vm_log.txt fixture should exist");
+        let fixture_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-programs/tolk/mock_vm_log.txt");
+        let log_text =
+            std::fs::read_to_string(&fixture_path).expect("mock_vm_log.txt fixture should exist");
 
         let logs = parse_vm_logs(&log_text).unwrap();
         // The fixture has 7 instructions.
@@ -487,8 +477,8 @@ stack: []
 
     #[test]
     fn test_fixture_convert_to_trace_events() {
-        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("test-programs/tolk/mock_vm_log.txt");
+        let fixture_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-programs/tolk/mock_vm_log.txt");
         let log_text = std::fs::read_to_string(&fixture_path).unwrap();
         let logs = parse_vm_logs(&log_text).unwrap();
         let source = PathBuf::from("flow_test.tolk");

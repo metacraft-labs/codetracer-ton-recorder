@@ -10,8 +10,8 @@ use std::path::Path;
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
-use eyre::{Context, Result, eyre};
+use codetracer_trace_writer::{create_trace_writer, TraceEventsFileFormat};
+use eyre::{eyre, Context, Result};
 
 use crate::source_map::SourceMap;
 use crate::stack_tracker::{self, StackTracker};
@@ -47,10 +47,7 @@ enum Statement {
         line: u32,
     },
     /// `return <expr>;`
-    Return {
-        expr: String,
-        line: u32,
-    },
+    Return { expr: String, line: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -110,11 +107,8 @@ impl TolkTracer {
 
         // Register common Tolk types.
         for type_name in &["int", "bool"] {
-            let type_id = TraceWriter::ensure_type_id(
-                &mut *tracer.writer,
-                TypeKind::Int,
-                type_name,
-            );
+            let type_id =
+                TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Int, type_name);
             tracer.type_ids.insert(type_name.to_string(), type_id);
         }
 
@@ -122,27 +116,19 @@ impl TolkTracer {
         tracer.evaluate_program(source_path, &functions)?;
 
         // -- 6. Finish writing --
-        TraceWriter::finish_writing_trace_events(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
             .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer)
-            .map_err(|e| eyre!("{e}"))?;
+        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
 
         Ok(())
     }
 
     /// Evaluate the program starting from `main()`.
-    fn evaluate_program(
-        &mut self,
-        source_path: &Path,
-        functions: &[FunctionDef],
-    ) -> Result<()> {
+    fn evaluate_program(&mut self, source_path: &Path, functions: &[FunctionDef]) -> Result<()> {
         // Build a function lookup table.
-        let func_map: HashMap<String, &FunctionDef> = functions
-            .iter()
-            .map(|f| (f.name.clone(), f))
-            .collect();
+        let func_map: HashMap<String, &FunctionDef> =
+            functions.iter().map(|f| (f.name.clone(), f)).collect();
 
         // Find and call main.
         let main_fn = func_map
@@ -189,11 +175,7 @@ impl TolkTracer {
                     line,
                 } => {
                     // Emit Step event.
-                    TraceWriter::register_step(
-                        &mut *self.writer,
-                        source_path,
-                        Line(*line as i64),
-                    );
+                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
                     // Evaluate the expression via the real TVM.
                     if let Some(val) = self.eval_expr(expr, &env, source_path, func_map)? {
@@ -228,11 +210,7 @@ impl TolkTracer {
                 }
                 Statement::Return { expr, line } => {
                     // Emit Step event for the return line.
-                    TraceWriter::register_step(
-                        &mut *self.writer,
-                        source_path,
-                        Line(*line as i64),
-                    );
+                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
                     // Evaluate the return expression via the real TVM.
                     if let Some(val) = self.eval_expr(expr, &env, source_path, func_map)? {
@@ -466,11 +444,7 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
 
     // return statement: `return <expr>;`
     if trimmed.starts_with("return ") {
-        let expr = trimmed[7..]
-            .trim()
-            .trim_end_matches(';')
-            .trim()
-            .to_string();
+        let expr = trimmed[7..].trim().trim_end_matches(';').trim().to_string();
         if !expr.is_empty() {
             return Some(Statement::Return {
                 expr,

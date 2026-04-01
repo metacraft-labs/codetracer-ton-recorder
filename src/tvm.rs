@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use eyre::{Result, eyre};
+use eyre::{eyre, Result};
 use tycho_vm::{GasParams, NoLibraries, RcStackValue, VmState};
 
 // ---------------------------------------------------------------------------
@@ -98,9 +98,7 @@ impl TvmProgram {
 // ---------------------------------------------------------------------------
 
 /// Execute a TVM program (a Cell) and return the top-of-stack integer.
-fn run_tvm_program(
-    cell: tycho_vm::__export::tycho_types::cell::Cell,
-) -> Result<i64> {
+fn run_tvm_program(cell: tycho_vm::__export::tycho_types::cell::Cell) -> Result<i64> {
     let mut output = String::new();
     let mut vm = VmState::builder()
         .with_code(cell)

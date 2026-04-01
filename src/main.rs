@@ -135,10 +135,7 @@ fn main() -> Result<()> {
         Commands::TraceSandbox(args) => trace_sandbox(args),
         Commands::Replay(args) => replay(args),
         Commands::Version => {
-            println!(
-                "codetracer-ton-recorder {}",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("codetracer-ton-recorder {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
