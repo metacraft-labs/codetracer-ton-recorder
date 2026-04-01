@@ -86,12 +86,8 @@ impl StackTracker {
 
         let derived_name = match (&left, &right) {
             (Some((left_val, left_name)), Some((right_val, right_name))) => {
-                let left_str = left_name
-                    .clone()
-                    .unwrap_or_else(|| left_val.to_string());
-                let right_str = right_name
-                    .clone()
-                    .unwrap_or_else(|| right_val.to_string());
+                let left_str = left_name.clone().unwrap_or_else(|| left_val.to_string());
+                let right_str = right_name.clone().unwrap_or_else(|| right_val.to_string());
                 Some(format!("{} {} {}", left_str, op.symbol(), right_str))
             }
             _ => None,

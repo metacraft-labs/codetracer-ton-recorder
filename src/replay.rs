@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use codetracer_trace_types::{Line, TypeKind, ValueRecord};
 use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
-use eyre::{Context, Result, eyre};
+use codetracer_trace_writer::{create_trace_writer, TraceEventsFileFormat};
+use eyre::{eyre, Context, Result};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -205,8 +205,7 @@ pub fn replay_transaction(
         .map_err(|e| eyre!("{e}"))?;
     TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
         .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path)
-        .map_err(|e| eyre!("{e}"))?;
+    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).map_err(|e| eyre!("{e}"))?;
 
     TraceWriter::start(&mut *writer, source_path, Line(1));
 
@@ -272,10 +271,7 @@ mod tests {
             endpoint: "http://localhost:4443".to_string(),
             source_dir: Some(PathBuf::from("/tmp/contract-src")),
         };
-        assert_eq!(
-            config.source_dir,
-            Some(PathBuf::from("/tmp/contract-src"))
-        );
+        assert_eq!(config.source_dir, Some(PathBuf::from("/tmp/contract-src")));
     }
 
     // -- ContractState tests -------------------------------------------------
@@ -391,11 +387,7 @@ mod tests {
             source_dir: None,
         };
         let tmp = tempfile::tempdir().unwrap();
-        let result = replay_transaction(
-            &config,
-            tmp.path(),
-            TraceEventsFileFormat::Json,
-        );
+        let result = replay_transaction(&config, tmp.path(), TraceEventsFileFormat::Json);
         // Should fail because Liteserver is not implemented yet.
         assert!(result.is_err());
     }

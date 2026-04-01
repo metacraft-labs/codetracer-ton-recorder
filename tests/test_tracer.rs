@@ -17,12 +17,8 @@ fn test_programs_dir() -> PathBuf {
 
 /// Helper: run the tracer on a Tolk source file and return the output directory.
 fn run_tracer_on_file(source_path: &Path, out_dir: &Path) {
-    codetracer_ton_recorder::recorder::record(
-        source_path,
-        out_dir,
-        TraceEventsFileFormat::Json,
-    )
-    .expect("trace_program should succeed");
+    codetracer_ton_recorder::recorder::record(source_path, out_dir, TraceEventsFileFormat::Json)
+        .expect("trace_program should succeed");
 }
 
 /// Helper: parse the trace events JSON from the output directory.
@@ -263,10 +259,8 @@ fn test_tolk_step_events() {
     let events = load_trace_events(&out_dir);
 
     // Count Step events.
-    let step_events: Vec<&serde_json::Value> = events
-        .iter()
-        .filter(|e| e.get("Step").is_some())
-        .collect();
+    let step_events: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e.get("Step").is_some()).collect();
 
     // flow_test.tolk has 5 var bindings + 1 return in compute() + 1 return in main()
     // but main()'s return calls compute() which adds its own steps.
@@ -284,7 +278,9 @@ fn test_tolk_step_events() {
             step.get("path_id").is_some(),
             "Step event should have path_id field"
         );
-        let line = step["line"].as_i64().expect("Step line should be an integer");
+        let line = step["line"]
+            .as_i64()
+            .expect("Step line should be an integer");
         assert!(line > 0, "Step line should be positive, got {}", line);
         assert!(
             line <= 15,
