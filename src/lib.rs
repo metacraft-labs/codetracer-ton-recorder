@@ -6,6 +6,9 @@
 //! CodeTracer trace format for debugging and analysis.
 
 pub mod recorder;
+pub mod replay;
+pub mod sandbox;
 pub mod source_map;
+pub mod stack_tracker;
 pub mod tracer;
 pub mod tvm;
