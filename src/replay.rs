@@ -188,8 +188,7 @@ pub fn replay_transaction(
 
     let source_path = config
         .source_dir
-        .as_ref()
-        .map(|p| p.as_path())
+        .as_deref()
         .unwrap_or_else(|| Path::new("contract.tolk"));
 
     let mut writer = create_trace_writer(&source_label, &[], format);
