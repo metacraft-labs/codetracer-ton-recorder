@@ -14,6 +14,7 @@ use codetracer_trace_writer::{TraceEventsFileFormat, create_trace_writer};
 use eyre::{Context, Result, eyre};
 
 use crate::source_map::SourceMap;
+use crate::stack_tracker::{self, StackTracker};
 
 // ---------------------------------------------------------------------------
 // Tolk AST types
@@ -175,6 +176,9 @@ impl TolkTracer {
         // Local variable environment for this function.
         let mut env: HashMap<String, i64> = HashMap::new();
         let mut return_value: Option<i64> = None;
+        // Symbolic stack tracker: mirrors TVM execution to reconstruct
+        // source-level variable names from stack positions.
+        let mut sym_stack = StackTracker::new();
 
         for stmt in &func.body {
             match stmt {
@@ -193,9 +197,21 @@ impl TolkTracer {
 
                     // Evaluate the expression via the real TVM.
                     if let Some(val) = self.eval_expr(expr, &env, source_path, func_map)? {
+                        // Track the expression symbolically. track_expr
+                        // decomposes the expression and produces a derived
+                        // name (e.g. "a + b") which we can inspect but the
+                        // authoritative name is the LHS variable name.
+                        let expr_tracker = stack_tracker::track_expr(expr, &env, val);
+                        let _derived = expr_tracker.variables_at_step();
+
                         env.insert(name.clone(), val);
 
-                        // Emit Value event.
+                        // Push the bound variable onto the symbolic stack so
+                        // subsequent expressions can reference it.
+                        sym_stack.push(val, Some(name.clone()));
+
+                        // Emit Value event -- use the source-level variable
+                        // name (which the stack tracker now carries).
                         let type_id = self
                             .type_ids
                             .get(type_name)

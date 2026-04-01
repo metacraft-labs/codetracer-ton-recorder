@@ -1,0 +1,22 @@
+execute PUSHINT 10
+gas: 26 -> 18
+stack: [10]
+execute PUSHINT 32
+gas: 18 -> 10
+stack: [10 32]
+execute ADD
+gas: 10 -> 2
+stack: [42]
+execute PUSHINT 2
+gas: 2 -> -6
+stack: [42 2]
+execute MUL
+gas: -6 -> -14
+stack: [84]
+execute PUSHINT 10
+gas: -14 -> -22
+stack: [84 10]
+execute ADD
+gas: -22 -> -30
+stack: [94]
+exit code: 0
