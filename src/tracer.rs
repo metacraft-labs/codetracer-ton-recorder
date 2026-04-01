@@ -310,8 +310,8 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
         // Parse return type: look for ): <type> {
         let return_type = if let Some(paren_end) = after_keyword.find(')') {
             let after_paren = after_keyword[paren_end + 1..].trim();
-            if after_paren.starts_with(':') {
-                let after_colon = after_paren[1..].trim();
+            if let Some(stripped) = after_paren.strip_prefix(':') {
+                let after_colon = stripped.trim();
                 let type_end = after_colon.find('{').unwrap_or(after_colon.len());
                 let rt = after_colon[..type_end].trim().to_string();
                 if rt.is_empty() {
