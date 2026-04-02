@@ -119,6 +119,9 @@ impl TolkTracer {
         // -- 5. Evaluate and emit trace events --
         tracer.evaluate_program(source_path, &functions)?;
 
+        // Close the <toplevel> call that start() opened.
+        TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
+
         // -- 6. Finish writing --
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
@@ -140,28 +143,42 @@ impl TolkTracer {
             .ok_or_else(|| eyre!("no main function found in Tolk program"))?;
 
         let mut env = HashMap::new();
-        self.evaluate_function(source_path, main_fn, &func_map, &mut env)?;
+        // Merge main() into <toplevel> by skipping its Call/Return events.
+        // TraceWriter::start() already created <toplevel> at depth 0. Emitting
+        // register_call(main) would push all main-body steps to depth 1 and any
+        // nested calls (e.g. compute()) to depth 2. The db-backend's step-over
+        // from depth 0 would then skip every step, breaking navigation.
+        self.evaluate_function(source_path, main_fn, &func_map, &mut env, true)?;
 
         Ok(())
     }
 
     /// Evaluate a single function, emitting trace events.
     /// Returns the function's return value if any.
+    ///
+    /// When `is_entry_point` is true, the Call/Return events for this function
+    /// are suppressed — its body is evaluated directly at the caller's depth
+    /// (merged into `<toplevel>`).
     fn evaluate_function(
         &mut self,
         source_path: &Path,
         func: &FunctionDef,
         func_map: &HashMap<String, &FunctionDef>,
         _parent_env: &mut HashMap<String, i64>,
+        is_entry_point: bool,
     ) -> Result<Option<i64>> {
-        // Emit Call event.
+        // Register function metadata (for function list / calltrace).
         let fn_id = TraceWriter::ensure_function_id(
             &mut *self.writer,
             &func.name,
             source_path,
             Line(func.line as i64),
         );
-        TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+        // Only emit Call event for non-entry-point functions. The entry point
+        // is merged into <toplevel> to keep its body at depth 0.
+        if !is_entry_point {
+            TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
+        }
 
         // Local variable environment for this function.
         let mut env: HashMap<String, i64> = HashMap::new();
@@ -224,15 +241,18 @@ impl TolkTracer {
             }
         }
 
-        // Emit Return event.
-        match return_value {
-            Some(val) => {
-                let type_id = self.type_ids.get("int").copied().unwrap();
-                let value = ValueRecord::Int { i: val, type_id };
-                TraceWriter::register_return(&mut *self.writer, value);
-            }
-            None => {
-                TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+        // Emit Return event (skip for entry point — its steps live under
+        // <toplevel> which is closed separately).
+        if !is_entry_point {
+            match return_value {
+                Some(val) => {
+                    let type_id = self.type_ids.get("int").copied().unwrap();
+                    let value = ValueRecord::Int { i: val, type_id };
+                    TraceWriter::register_return(&mut *self.writer, value);
+                }
+                None => {
+                    TraceWriter::register_return(&mut *self.writer, NONE_VALUE);
+                }
             }
         }
 
@@ -261,7 +281,7 @@ impl TolkTracer {
                 let callee = (*callee).clone();
                 let mut dummy_env = HashMap::new();
                 let result =
-                    self.evaluate_function(source_path, &callee, func_map, &mut dummy_env)?;
+                    self.evaluate_function(source_path, &callee, func_map, &mut dummy_env, false)?;
                 return Ok(result);
             }
         }
