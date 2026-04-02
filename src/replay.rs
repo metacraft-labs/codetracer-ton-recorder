@@ -196,7 +196,11 @@ pub fn replay_transaction(
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-    let events_path = out_dir.join("trace.bin");
+    let events_filename = match format {
+        TraceEventsFileFormat::Json => "trace.json",
+        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+    };
+    let events_path = out_dir.join(events_filename);
     let metadata_path = out_dir.join("trace_metadata.json");
     let paths_path = out_dir.join("trace_paths.json");
 
