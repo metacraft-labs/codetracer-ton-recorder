@@ -11,8 +11,8 @@ name = "codetracer-ton-recorder"
 path = "src/main.rs"
 
 [dependencies]
-codetracer_trace_types = "0.16"
-codetracer_trace_writer = "0.17"
+codetracer_trace_types = { path = "../codetracer-trace-format/codetracer_trace_types" }
+codetracer_trace_writer_nim = { path = "../codetracer-trace-format/codetracer_trace_writer_nim" }
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 serde = { version = "1", features = ["derive"] }
