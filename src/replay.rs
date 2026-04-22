@@ -239,6 +239,7 @@ pub fn replay_transaction(
     TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
     TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
     TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    writer.close().map_err(|e| eyre!("{e}"))?;
 
     eprintln!("Replay trace written to {}", out_dir.display());
     Ok(())
