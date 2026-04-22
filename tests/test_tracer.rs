@@ -11,7 +11,7 @@ fn test_programs_dir() -> PathBuf {
 }
 
 fn run_tracer_on_file(source_path: &Path, out_dir: &Path) {
-    codetracer_ton_recorder::recorder::record(source_path, out_dir, TraceEventsFileFormat::Json)
+    codetracer_ton_recorder::recorder::record(source_path, out_dir, TraceEventsFileFormat::Binary)
         .expect("trace_program should succeed");
 }
 
