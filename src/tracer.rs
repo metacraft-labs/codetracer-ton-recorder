@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use codetracer_trace_types::{Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
@@ -180,6 +180,26 @@ impl TolkTracer {
         // Only emit Call event for non-entry-point functions. The entry point
         // is merged into <toplevel> to keep its body at depth 0.
         if !is_entry_point {
+            // Stage canonical Call args via writer.arg(name, value).
+            //
+            // The Tolk source carries a formal parameter list per
+            // function (`fun foo(a: int, b: int): int`). We use that
+            // list here so the calltrace pane's `.call-arg` rows show
+            // each declared parameter rather than the empty list that
+            // pre-fix register_call(fn_id, vec![]) produced.
+            //
+            // Concrete values are NONE_VALUE for now: the current Tolk
+            // parser only recognises zero-arg call sites
+            // (`compute()`), so the caller has no way to surface arg
+            // values to this point. Extending parse_function_call /
+            // evaluate_function to thread arg expressions would let
+            // the staging path emit live values; tracked as an
+            // open follow-up in AUDIT-CTFS-2026-05.md (parallel to
+            // PolkaVM 1.55 ink!-metadata symbolic decoding and Miden
+            // 1.56 per-procedure ABI / argument-name parsing).
+            for (param_name, _param_type) in &func.params {
+                let _ = TraceWriter::arg(&mut *self.writer, param_name, NONE_VALUE);
+            }
             TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
         }
 
@@ -289,8 +309,27 @@ impl TolkTracer {
             }
         }
 
-        // Evaluate via real TVM execution.
-        Ok(crate::tvm::tvm_eval_expr(expr, env))
+        // Evaluate via real TVM execution.  Use the checked variant
+        // so we can route TVM execution failures (overflow, gas
+        // exhaustion, divide-by-zero, etc.) through the structured
+        // event channel instead of dropping them silently.
+        match crate::tvm::tvm_eval_expr_checked(expr, env) {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                let message = format!("{err}");
+                eprintln!("TVM execution error in '{expr}': {message}");
+                TraceWriter::register_special_event(
+                    &mut *self.writer,
+                    EventLogKind::Error,
+                    "tvm_exception",
+                    &message,
+                );
+                // Treat as missing-value for downstream evaluation;
+                // the partial trace continues to finalise cleanly
+                // (matches Miden 1.56's "capture and break" pattern).
+                Ok(None)
+            }
+        }
     }
 }
 

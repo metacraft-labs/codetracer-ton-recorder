@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use codetracer_trace_types::{Line, TypeKind, ValueRecord};
+use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
@@ -280,6 +280,29 @@ pub fn trace_sandbox(
                     type_id: int_type_id,
                 };
                 TraceWriter::register_variable_with_full_value(&mut *writer, "tos", value);
+            }
+        }
+
+        // Route any non-success TVM exit code through the structured
+        // event channel as an Error special event.  TVM's `THROW`
+        // family of opcodes terminates the VM with a non-zero exit
+        // code (see TVM Spec §4.5 "Exception primitives" -
+        // https://docs.ton.org/tvm.pdf).  Pre-fix the recorder
+        // dropped that signal entirely; post-fix the frontend's
+        // error stream surfaces it (mirrors Miden 1.56
+        // `miden_vm_error` and Cairo 1.50 `CairoPanic` routing).
+        if let Some(exit_code) = event.exit_code {
+            if exit_code != 0 {
+                let message = format!(
+                    "TVM exception at instruction '{}' (exit code {})",
+                    event.instruction, exit_code
+                );
+                TraceWriter::register_special_event(
+                    &mut *writer,
+                    EventLogKind::Error,
+                    "tvm_exception",
+                    &message,
+                );
             }
         }
     }
