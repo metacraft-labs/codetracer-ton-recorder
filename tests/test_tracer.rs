@@ -11,7 +11,11 @@ fn test_programs_dir() -> PathBuf {
 }
 
 fn run_tracer_on_file(source_path: &Path, out_dir: &Path) {
-    codetracer_ton_recorder::recorder::record(source_path, out_dir, TraceEventsFileFormat::Binary)
+    // Use the canonical CTFS multi-stream container -- the format
+    // the Nim ct_reader_* FFI and the db-backend's CTFSTraceReader
+    // consume directly.  See AUDIT-CTFS-2026-05.md (audit a) for the
+    // CLI-side default change that aligns with this.
+    codetracer_ton_recorder::recorder::record(source_path, out_dir, TraceEventsFileFormat::Ctfs)
         .expect("trace_program should succeed");
 }
 
@@ -98,12 +102,13 @@ fn test_ton_cli_record() {
     let out_dir = tmp_dir.path().join("cli-traces");
     let source_path = test_programs_dir().join("flow_test.tolk");
 
+    // Exercise the canonical CTFS path (post-audit default).
     let output = std::process::Command::new(env!("CARGO"))
         .args([
             "run", "--quiet", "--",
             "record", source_path.to_str().unwrap(),
             "--out-dir", out_dir.to_str().unwrap(),
-            "--format", "json",
+            "--format", "ctfs",
         ])
         .output()
         .expect("failed to run");

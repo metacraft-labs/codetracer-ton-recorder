@@ -163,21 +163,47 @@ fn extract_int_from_stack_value(value: &RcStackValue) -> Result<i64> {
 /// - Comparison operators: ==, !=, <, >, <=, >=
 /// - Parenthesized sub-expressions
 pub fn tvm_eval_expr(expr: &str, known: &HashMap<String, i64>) -> Option<i64> {
+    tvm_eval_expr_checked(expr, known).ok().flatten()
+}
+
+/// Like [`tvm_eval_expr`], but distinguishes "expression could not be
+/// parsed / used variables are not bound" (returns `Ok(None)`) from
+/// "TVM execution failed" (returns `Err(msg)`).
+///
+/// The recorder uses this checked entry point to route real TVM
+/// exceptions (e.g. divide-by-zero, integer overflow, gas exhaustion)
+/// through `register_special_event(EventLogKind::Error,
+/// "tvm_exception", &msg)` so they surface on the structured event
+/// channel rather than being silently dropped by `.ok()`. Same shape
+/// as Cairo 1.50 CairoPanic and Miden 1.56 miden_vm_error routing.
+pub fn tvm_eval_expr_checked(
+    expr: &str,
+    known: &HashMap<String, i64>,
+) -> Result<Option<i64>> {
     let expr = expr.trim();
     if expr.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    // Parse the expression into an AST.
-    let ast = parse_expr(expr, known)?;
+    // Parse the expression into an AST.  An unparseable expression is
+    // a structural problem (no point routing it through TVM error);
+    // return Ok(None) so the caller continues without an event.
+    let ast = match parse_expr(expr, known) {
+        Some(ast) => ast,
+        None => return Ok(None),
+    };
 
     // Compile AST to TVM bytecode.
     let mut program = TvmProgram::new();
     compile_ast(&ast, &mut program);
 
-    // Build the cell and run.
-    let cell = program.build_cell().ok()?;
-    run_tvm_program(cell).ok()
+    // Build the cell and run.  These two paths CAN surface real TVM
+    // errors (cell-builder overflow + VM exit-code != 0).  Propagate
+    // the error string through Err so the recorder can register it
+    // as a structured event.
+    let cell = program.build_cell()?;
+    let value = run_tvm_program(cell)?;
+    Ok(Some(value))
 }
 
 /// Simple expression AST node.
