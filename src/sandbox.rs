@@ -34,6 +34,17 @@ pub struct VmLog {
     pub stack: Vec<String>,
     /// Exit code, present only on the final log entry.
     pub exit_code: Option<i32>,
+    /// Parsed TVM action-list entries observed after this instruction.
+    pub actions: Vec<TvmAction>,
+}
+
+/// A structured TVM action-list entry parsed from sandbox output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TvmAction {
+    /// Stable CTFS metadata string for this action.
+    pub metadata: &'static str,
+    /// Human-readable action payload copied from the sandbox trailer.
+    pub content: String,
 }
 
 /// Configuration for sandbox trace ingestion.
@@ -62,6 +73,8 @@ pub struct TraceEvent {
     pub stack: Vec<String>,
     /// Exit code (only on the last event if the log contains one).
     pub exit_code: Option<i32>,
+    /// Parsed TVM action-list entries attached to this step.
+    pub actions: Vec<TvmAction>,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +131,7 @@ pub fn parse_vm_logs(log_text: &str) -> Result<Vec<VmLog>> {
                 gas_remaining,
                 stack,
                 exit_code: None,
+                actions: Vec::new(),
             });
 
             i += 1;
@@ -138,11 +152,55 @@ pub fn parse_vm_logs(log_text: &str) -> Result<Vec<VmLog>> {
             continue;
         }
 
+        if let Some(action) = parse_action_line(trimmed) {
+            let last = logs
+                .last_mut()
+                .ok_or_else(|| eyre!("action-list entry appeared before any instruction"))?;
+            last.actions.push(action);
+            i += 1;
+            continue;
+        }
+
         // Skip blank or unrecognised lines.
         i += 1;
     }
 
     Ok(logs)
+}
+
+/// Parse one sandbox action-list trailer line.
+///
+/// `@ton/sandbox` log formatting has changed across releases, and older
+/// fixtures often preserve only plain text trailers.  Accept the stable
+/// shape we need for recorder semantics: an action/out-action prefix
+/// followed by the TVM action name and its debug payload.  Out-message
+/// actions (`SENDRAWMSG` / `SENDMSG`) are routed with `tvm_out_message`;
+/// other TVM action-list entries use `tvm_action`.
+fn parse_action_line(line: &str) -> Option<TvmAction> {
+    let rest = line
+        .strip_prefix("action:")
+        .or_else(|| line.strip_prefix("out action:"))
+        .or_else(|| line.strip_prefix("out_action:"))
+        .or_else(|| line.strip_prefix("tvm action:"))?
+        .trim();
+
+    if rest.is_empty() {
+        return None;
+    }
+
+    let action_name = rest.split_whitespace().next().unwrap_or_default();
+    let action_name = action_name
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .to_ascii_uppercase();
+    let metadata = match action_name.as_str() {
+        "SENDRAWMSG" | "SENDMSG" | "SEND_MSG" => "tvm_out_message",
+        _ => "tvm_action",
+    };
+
+    Some(TvmAction {
+        metadata,
+        content: rest.to_string(),
+    })
 }
 
 /// Parse a `gas: <before> -> <after>` line.
@@ -213,6 +271,7 @@ pub fn convert_vm_logs_to_trace(logs: &[VmLog], _source_path: &Path) -> Result<V
             gas_remaining: log.gas_remaining,
             stack: log.stack.clone(),
             exit_code: log.exit_code,
+            actions: log.actions.clone(),
         });
     }
 
@@ -305,6 +364,15 @@ pub fn trace_sandbox(
                 );
             }
         }
+
+        for action in &event.actions {
+            TraceWriter::register_special_event(
+                &mut *writer,
+                EventLogKind::EvmEvent,
+                action.metadata,
+                &action.content,
+            );
+        }
     }
 
     // Finish.
@@ -375,6 +443,34 @@ exit code: 0
         assert_eq!(logs[0].stack, vec!["10"]);
         assert_eq!(logs[1].stack, vec!["10", "32"]);
         assert_eq!(logs[2].stack, vec!["42"]);
+    }
+
+    #[test]
+    fn test_parse_vm_logs_action_trailer() {
+        let log = "\
+execute PUSHINT 1
+gas: 26 -> 18
+stack: [1]
+exit code: 0
+action: SENDRAWMSG mode=3 dst=EQDabc value=100 body=0xdeadbeef
+action: SETCODE cells=1
+";
+
+        let logs = parse_vm_logs(log).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].actions,
+            vec![
+                TvmAction {
+                    metadata: "tvm_out_message",
+                    content: "SENDRAWMSG mode=3 dst=EQDabc value=100 body=0xdeadbeef".to_string(),
+                },
+                TvmAction {
+                    metadata: "tvm_action",
+                    content: "SETCODE cells=1".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

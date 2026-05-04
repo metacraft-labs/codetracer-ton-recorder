@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::{NimTraceReaderHandle, TraceEventsFileFormat};
 
 /// Canonical CodeTracer multi-stream (CTFS) container magic bytes.
 ///
@@ -37,6 +37,36 @@ fn locate_ct_file(out_dir: &std::path::Path) -> PathBuf {
         "expected exactly one .ct file in {out_dir:?}, got {ct_files:?}",
     );
     ct_files.remove(0)
+}
+
+fn read_events(out_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let ct_path = locate_ct_file(out_dir);
+    let reader = NimTraceReaderHandle::open(&ct_path.to_string_lossy()).unwrap_or_else(|e| {
+        panic!(
+            "failed to open Nim CTFS reader for {}: {e}",
+            ct_path.display()
+        )
+    });
+    (0..reader.event_count())
+        .map(|index| {
+            let json = reader.event_json(index).expect("read event JSON");
+            serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("invalid event JSON: {e}: {json}"))
+        })
+        .collect()
+}
+
+fn string_from_json_byte_array(value: &serde_json::Value) -> String {
+    let bytes: Vec<u8> = value
+        .as_array()
+        .unwrap_or_else(|| panic!("expected byte array JSON, got {value:#}"))
+        .iter()
+        .map(|byte| {
+            byte.as_u64()
+                .unwrap_or_else(|| panic!("expected byte value, got {byte:#}")) as u8
+        })
+        .collect();
+    String::from_utf8(bytes).unwrap_or_else(|e| panic!("expected UTF-8 event payload: {e}"))
 }
 
 /// Audit (a) + (g): the canonical CTFS dispatch produces a valid
@@ -156,5 +186,49 @@ fn call_arg_staging_does_not_empty_trace() {
         bytes.len() >= 64,
         ".ct file should remain materially populated post-arg-staging; got {} bytes",
         bytes.len()
+    );
+}
+
+/// Audit (d): sandbox action-list out-message trailers should surface as
+/// canonical EvmEvent special events in the CTFS event stream.
+#[test]
+fn ctfs_reader_sees_sandbox_out_message_event() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let log_path = tmp.path().join("vm_logs_full.txt");
+    std::fs::write(
+        &log_path,
+        "\
+execute PUSHINT 1
+gas: 26 -> 18
+stack: [1]
+exit code: 0
+action: SENDRAWMSG mode=3 dst=EQDabc value=100 body=0xdeadbeef
+",
+    )
+    .expect("write sandbox log");
+
+    let source_path = tmp.path().join("contract.tolk");
+    std::fs::write(&source_path, "fun main(): int {\n    return 1;\n}\n").expect("write source");
+
+    let out_dir = tmp.path().join("traces");
+    codetracer_ton_recorder::sandbox::trace_sandbox(
+        &log_path,
+        &source_path,
+        &out_dir,
+        TraceEventsFileFormat::Ctfs,
+    )
+    .expect("trace sandbox log");
+
+    let events = read_events(&out_dir);
+    let event = events
+        .iter()
+        .find(|event| event["kind"].as_str() == Some("stderr"))
+        .unwrap_or_else(|| panic!("missing CTFS EvmEvent entry: {events:#?}"));
+    let content = string_from_json_byte_array(&event["data"]);
+    assert!(
+        content.contains("SENDRAWMSG")
+            && content.contains("EQDabc")
+            && content.contains("0xdeadbeef"),
+        "unexpected sandbox out-message content: {content}"
     );
 }

@@ -63,7 +63,7 @@ embedding the VM via a sibling crate; stack-machine VM) and PolkaVM
 | a | CLI defaults to `TraceEventsFileFormat::Ctfs` | **GAP** | **OK** | Pre-fix `src/main.rs`'s `OutputFormat` enum exposed only `Binary` (legacy CBOR + Zstd) and `Json`, with `Binary` as the default for all three subcommands (`record`, `replay`, `trace-sandbox`). The canonical CTFS multi-stream container — the one the Nim `ct_reader_*` FFI and the db-backend's `CTFSTraceReader` consume directly — was not selectable from the CLI at all. Post-fix the enum gains a `Ctfs` variant (listed first), with doc-comments on each option, plus an `impl From<OutputFormat> for TraceEventsFileFormat` so each of the three dispatch sites collapses to `let format: TraceEventsFileFormat = args.format.into();`. The `default_value` is now `"ctfs"` for all three `--format` flags. The `OutputFormat::as_str` helper is added (marked `#[allow(dead_code)]`) for future `trace_metadata.json` `format` field emission, mirroring Fuel 1.53 / PolkaVM 1.55 / Miden 1.56. Same default-format fix as EVM (1.39), Solana (1.44), Move (1.46), Cardano (1.48), Cairo (1.50), Flow (1.52), Fuel (1.53), PolkaVM (1.55), Miden (1.56). |
 | b | `register_call` for each call | OK | OK | The recorder emits `register_call(fn_id, args)` for every parsed Tolk function call (any expression matching `<name>()` recurses into `evaluate_function` which pushes / pops the call boundary). The matching exit emits `register_return`. The entry point (`main`) is intentionally merged into `<toplevel>` so its body lives at depth 0 — this design pre-dates the audit and is documented in `tracer.rs`'s `evaluate_program`. `sandbox.rs` and `replay.rs` each emit one synthetic top-level call (`<sandbox>` / `replay:<txhash>`) framing the parsed instruction stream / replay summary. |
 | c | Call args via `register_call_arg` / `arg()` | **GAP** | **OK** (declared params) / **OPEN** (live values) | Pre-fix the call-detection branch in `tracer.rs` always called `register_call(fn_id, vec![])`, so the calltrace pane showed every Tolk function invocation with empty arguments even when the function had a formal parameter list. Post-fix the call branch iterates `func.params` (the (name, type) pairs the parser already extracts from `fun foo(a: int, b: int): int`) and stages each through `TraceWriter::arg(param_name, NONE_VALUE)` immediately before `register_call`. This populates `CallRecord.args` with the declared parameter names so the `.call-arg` rows in the calltrace pane match the source. **Open**: actual run-time arg values are still `NONE_VALUE` because the current Tolk parser (`parse_function_call`) only recognises zero-arg call sites (`compute()`); no expression-arg syntax (`compute(10, x)`) is parsed yet. Once the parser is extended to thread arg expressions, the same `arg()` staging path will accept live `ValueRecord::Int { … }` values without further audit work. Tracked under "Open gaps" below as the parser-extension follow-up. Parallel to PolkaVM 1.55 ink!-metadata symbolic decoding and Miden 1.56 per-procedure ABI parsing. |
-| d | Write/WriteOther/Error/EvmEvent for IO and structured events via `register_special_event` | **GAP (Error)** / **N/A (Write)** / **OPEN (EvmEvent)** | **OK (Error)** / **N/A (Write)** / **OPEN (EvmEvent)** | Pre-fix TVM execution failures (overflow, divide-by-zero, gas exhaustion, an unhandled `THROW`) propagated through `tvm.rs::run_tvm_program -> tvm_eval_expr` which mapped any error to `None` via `.ok()` — the failure was silently dropped, the partial trace did not surface the cause, and downstream eval continued as if the expression had simply been unparseable. Post-fix `tvm.rs` exposes a checked variant `tvm_eval_expr_checked -> Result<Option<i64>>` that distinguishes "not parseable / unbound variable" (`Ok(None)`) from "TVM execution failed" (`Err(message)`). `tracer.rs::eval_expr` now drives the checked variant and on `Err` routes the failure through `register_special_event(EventLogKind::Error, "tvm_exception", &message)` — the partial trace finalises cleanly and the structured event channel surfaces the error (mirrors Miden 1.56 `miden_vm_error`, Cairo 1.50 `CairoPanic`, and Fuel 1.53 `Panic`/`Revert` routing). `sandbox.rs` similarly checks `event.exit_code` per parsed `vm_logs_full` instruction and routes any non-zero exit code through `register_special_event(EventLogKind::Error, "tvm_exception", "TVM exception at instruction '…' (exit code N)")`. **N/A (Write)**: the recorder's TVM evaluator (`tycho-vm`) does not run a host-function bridge, so Tolk programs have no native stdout/stderr channel comparable to PolkaVM's `seal_debug_message` or EVM's `console_log`. **Open (EvmEvent)**: TON contracts emit structured outputs through TVM's *action list* (out-messages, `SETCODE`, `RAWRESERVE`, etc.) — the closest analogue to EVM `LOG` opcodes / Cairo `StarknetEvent` / Fuel `Receipt::LogData` / PolkaVM `seal_deposit_event`. The recorder currently does not surface action-list entries because the `record` and `trace-sandbox` paths run TVM under `tycho_vm::VmState::run()` without inspecting `vm.commited` afterwards (and the sandbox `vm_logs_full` parser does not extract action-list entries). Once that wiring lands, candidate routings are documented under "Open gaps" below. |
+| d | Write/WriteOther/Error/EvmEvent for IO and structured events via `register_special_event` | **GAP (Error)** / **N/A (Write)** / **OPEN (EvmEvent)** | **OK (Error)** / **N/A (Write)** / **PARTIAL (EvmEvent)** | Pre-fix TVM execution failures (overflow, divide-by-zero, gas exhaustion, an unhandled `THROW`) propagated through `tvm.rs::run_tvm_program -> tvm_eval_expr` which mapped any error to `None` via `.ok()` — the failure was silently dropped, the partial trace did not surface the cause, and downstream eval continued as if the expression had simply been unparseable. Post-fix `tvm.rs` exposes a checked variant `tvm_eval_expr_checked -> Result<Option<i64>>` that distinguishes "not parseable / unbound variable" (`Ok(None)`) from "TVM execution failed" (`Err(message)`). `tracer.rs::eval_expr` now drives the checked variant and on `Err` routes the failure through `register_special_event(EventLogKind::Error, "tvm_exception", &message)` — the partial trace finalises cleanly and the structured event channel surfaces the error (mirrors Miden 1.56 `miden_vm_error`, Cairo 1.50 `CairoPanic`, and Fuel 1.53 `Panic`/`Revert` routing). `sandbox.rs` similarly checks `event.exit_code` per parsed `vm_logs_full` instruction and routes any non-zero exit code through `register_special_event(EventLogKind::Error, "tvm_exception", "TVM exception at instruction '…' (exit code N)")`. **N/A (Write)**: the recorder's TVM evaluator (`tycho-vm`) does not run a host-function bridge, so Tolk programs have no native stdout/stderr channel comparable to PolkaVM's `seal_debug_message` or EVM's `console_log`. **Partial (EvmEvent)**: sandbox action-list trailer lines are now parsed and routed through `register_special_event(EventLogKind::EvmEvent, "tvm_out_message", payload)` for `SENDRAWMSG` / `SENDMSG`, or `"tvm_action"` for other action names. `tests/test_ctfs_audit.rs::ctfs_reader_sees_sandbox_out_message_event` opens the produced `.ct` through `NimTraceReaderHandle` and asserts the out-message payload is readable in the EvmEvent/stderr bucket. The source-level `record` path still does not surface TVM action-list entries because it only evaluates arithmetic expressions and does not execute contract message opcodes or inspect `VmState::committed_state.c5`. |
 | e | Thread events (Start / Exit / Switch) | OK (N/A) | OK (N/A) | TVM is single-threaded by design — one continuation chain at a time, no parallelism primitive. Recorder correctly emits no thread events. |
 | f | Step records for line navigation | OK | OK | `tracer.rs::evaluate_function` calls `register_step(source_path, Line(line))` at every parsed `var`/`val` binding and `return` statement. `sandbox.rs::trace_sandbox` calls `register_step` per parsed instruction (using the 1-based step number as the line). `replay.rs::replay_transaction` emits a single `register_step` for the synthetic balance dump (the replay path is a placeholder pending Liteserver integration). |
 | g | Canonical CTFS schema match | **GAP** | **OK** | Pre-fix the writer always produced a `.ct` file regardless of `--format` (the underlying Nim writer treats `Binary` and `Ctfs` identically at the time of writing — see `codetracer_trace_writer_nim/src/lib.rs::TraceEventsFileFormat::to_ffi`), but the CLI surface advertised only `binary`/`json` so consumers had no way to *request* the canonical container deliberately. Post-fix verified by `tests/test_ctfs_audit.rs::ctfs_writer_produces_ct_container`: invoking `record(flow_test.tolk, out_dir, TraceEventsFileFormat::Ctfs)` produces a single `.ct` file starting with the canonical magic bytes `0xC0 0xDE 0x72 0xAC 0xE2` and materially populated (>64 bytes). The existing `tests/test_tracer.rs` already asserted CTFS magic but was passing `TraceEventsFileFormat::Json` — that quirk worked because the underlying writer always emits the multi-stream container; the audit fixes the test to pass `TraceEventsFileFormat::Ctfs` explicitly so an eventual divergence between Json and Ctfs in the writer cannot silently break the recorder. |
@@ -285,33 +285,41 @@ TON contracts emit structured outputs through TVM's *action list*
 (`SENDRAWMSG`, `RAWRESERVE`, `SETCODE`, `CHANGELIB`, `SENDMSG`) —
 the closest analogue to EVM's `LOG` opcodes, Cairo's
 `StarknetEvent`, Fuel's `Receipt::LogData` / `MessageOut`, and
-PolkaVM's `seal_deposit_event`. The recorder's `record` /
-`trace-sandbox` paths do not currently inspect `vm.commited` or the
-parsed sandbox log's action-list section, so on-chain effects are
-not surfaced as structured events.
+PolkaVM's `seal_deposit_event`. The `trace-sandbox` path now parses
+plain action-list trailer lines such as
+`action: SENDRAWMSG mode=... dst=... value=... body=...` and routes
+them as `EventLogKind::EvmEvent` special events with metadata
+`"tvm_out_message"` (or `"tvm_action"` for non-message actions).
+The CTFS reader projects `EvmEvent` into the existing `stderr` bucket,
+matching the EVM / Circom audit convention.
+
+Remaining open source-level gap: the `record` path does not currently
+surface action-list entries because it compiles only simple arithmetic
+expressions to TVM bytecode and does not execute a contract receive
+path that can produce `SENDRAWMSG` / `SENDMSG` / `SETCODE` actions.
+When that execution layer exists, inspect `VmState::committed_state.c5`
+after `VmState::run()` and decode it with `tycho_types::models::
+OutActionsRevIter`.
 
 Concrete fix shape (mirrors EVM 1.39 `LOG` routing, Cairo 1.50
 `StarknetEvent` routing, Fuel 1.53 `Receipt` routing, and PolkaVM 1.55
 `seal_deposit_event` routing):
 
-* In `tracer.rs`, after the `vm.run()` call (when `tycho-vm` is
-  driven via a step-by-step iterator instead of all-at-once `run()`),
-  inspect `vm.commited.actions` and emit one `register_special_event`
-  per action:
+* In `tracer.rs`, after the contract-level `vm.run()` call, inspect
+  `vm.committed_state.c5` and emit one `register_special_event` per
+  decoded action:
   - `SendMsg` / `SendRawMsg` → `EventLogKind::EvmEvent` with metadata
-    `"ton_outmsg"` and content describing destination + value + body.
+    `"tvm_out_message"` and content describing destination + value + body.
   - `SetCode` → `EventLogKind::TraceLogEvent` with metadata
-    `"ton_setcode"`.
+    `"tvm_action"`.
   - `RawReserve` → `EventLogKind::TraceLogEvent` with metadata
-    `"ton_reserve"`.
-* In `sandbox.rs::parse_vm_logs`, extend the parser to recognise
-  `@ton/sandbox`'s action-list trailer and route the same way.
+    `"tvm_action"`.
 * Once `client_replay.rs` / Liteserver replay lands, the same
   routing applies to replay traces.
 
 The writer API (`register_special_event`) already supports all three
-kinds; the gap is recorder-side wiring + `tycho-vm` action-list
-inspection.
+kinds; the remaining gap is contract-level recorder wiring plus
+`committed_state.c5` decoding.
 
 ### Tolk parser extension for arg-passing call sites (audit c)
 
@@ -394,8 +402,10 @@ audited (gaps closed for default-Ctfs CLI + declared formal-parameter
 arg staging via `TraceWriter::arg(param_name, NONE_VALUE)` + TVM
 exception routing through `register_special_event(EventLogKind::Error,
 "tvm_exception", …)` for both the `record` (Tolk parser-driven)
-and `trace-sandbox` (vm_logs_full exit-code-driven) paths;
-TVM action-list / out-message routing + Tolk parser extension for
-arg-passing call sites + Liteserver replay-path tracing open as
-recorder-side / parser / RPC-integration follow-ups). Audited
-recorder count: 13 → 14.
+and `trace-sandbox` (vm_logs_full exit-code-driven) paths; sandbox
+action-list / out-message trailer routing through
+`register_special_event(EventLogKind::EvmEvent, "tvm_out_message",
+...)` is partial-closed with a CTFS reader assertion; source-level
+contract action-list decoding + Tolk parser extension for arg-passing
+call sites + Liteserver replay-path tracing open as recorder-side /
+parser / RPC-integration follow-ups). Audited recorder count: 13 → 14.
