@@ -409,3 +409,124 @@ action-list / out-message trailer routing through
 contract action-list decoding + Tolk parser extension for arg-passing
 call sites + Liteserver replay-path tracing open as recorder-side /
 parser / RPC-integration follow-ups). Audited recorder count: 13 → 14.
+
+## Convention compliance follow-up — 2026-05-08
+
+A second pass aligned the recorder with `Recorder-CLI-Conventions.md`
+§4 / §5, mirroring the leo / miden / move / polkavm / solana
+precedent.  The 2026-05-02 audit had landed a `--format` flag (with a
+`ctfs` value newly added as the default) at all three subcommand
+levels (`record`, `trace-sandbox`, `replay`); the convention pass
+**removes** the `--format` flag entirely.  Recorders are CTFS-only
+post-2026-05-08; human-readable conversion is delegated to `ct print`
+from `codetracer-trace-format-nim`.
+
+### CLI surface changes
+
+* `OutputFormat` enum and its `ValueEnum`/`From<OutputFormat>` impls
+  deleted from `src/main.rs`.
+* `--format` / `-f` flag removed from `RecordArgs`, `ReplayArgs`,
+  `TraceSandboxArgs` (3 subcommands).
+* `--out-dir` / `-o` switched to `Option<PathBuf>` so it can fall
+  back to the env-var.
+* New `CODETRACER_TON_RECORDER_OUT_DIR` env-var fallback (resolved
+  via the new `resolve_out_dir` helper).
+* New `CODETRACER_TON_RECORDER_DISABLED` env-var hook: every
+  subcommand short-circuits with a "skipping trace recording" note
+  when it is set.
+* `--help` text now points users at `ct print` from
+  `codetracer-trace-format-nim` for human-readable conversion.
+
+### Library / tracer changes
+
+* `src/recorder.rs::record(source_path, out_dir)` no longer takes a
+  `format` parameter; the writer is pinned to
+  `TraceEventsFileFormat::Ctfs`.
+* `src/tracer.rs::TolkTracer::trace_program(source_path,
+  source_code, out_dir)` no longer takes a `format` parameter; same
+  pin via the new module-level `CTFS_FORMAT` constant.  The
+  `events_filename` match-on-`format` collapsed to the unconditional
+  `trace.bin`.
+* `src/sandbox.rs::trace_sandbox(vm_log_path, source_path, out_dir)`
+  no longer takes a `format` parameter; same module-level
+  `CTFS_FORMAT` pin.
+* `src/replay.rs::replay_transaction(config, out_dir)` no longer
+  takes a `format` parameter; same pin.  Inline
+  `replay_transaction` test rewritten to drop the
+  `TraceEventsFileFormat::Json` argument.
+
+### Tests
+
+* `tests/test_cli.rs` (new) carries the six standard convention tests:
+  - `test_recorded_trace_via_ct_print_json` — records the bundled
+    `flow_test.tolk` fixture through `recorder::record`, pipes the
+    produced `.ct` file through `ct-print --json` from
+    `codetracer-trace-format-nim`, and asserts on **structural
+    anchors** (the fixture path `flow_test.tolk` and at least one of
+    the Tolk variable / function names `sum_val` / `doubled` /
+    `final_result` / `compute`).  Integer values are not asserted
+    because the TON recorder's variable payload (`ValueRecord::Int
+    { i, type_id }`) doesn't round-trip through `ct print --json`
+    today (same pre-existing limitation as cardano / circom / flow /
+    fuel / leo / miden / move / polkavm).
+  - `test_env_out_dir_used_when_flag_omitted` — sets
+    `CODETRACER_TON_RECORDER_OUT_DIR=<tmp>` without `--out-dir` and
+    asserts the env-supplied dir receives the `.ct` bundle.
+  - `test_env_disabled_skips_recording` — sets
+    `CODETRACER_TON_RECORDER_DISABLED=1` and asserts the recorder
+    exits 0 with no trace artefacts written.
+  - `test_format_flag_rejected_by_clap` — asserts clap rejects
+    `--format json` at all three subcommand levels (`record` /
+    `trace-sandbox` / `replay`).
+  - `test_no_format_flag_in_help` — asserts `--help` (top-level +
+    each subcommand) does not advertise `--format` or
+    `CODETRACER_FORMAT`.
+  - `test_help_mentions_ct_print` — asserts top-level `--help`
+    mentions `ct print` so users discover the canonical conversion
+    tool.
+* `tests/test_ctfs_audit.rs::ctfs_format_advertised_in_record_help`
+  and `ctfs_format_advertised_in_replay_and_sandbox_help`
+  **deleted**.  They asserted on the OLD `--format` contract (the
+  flag must be advertised with `[default: ctfs]`), which is
+  incompatible with the post-2026-05-08 contract (`--format` must
+  not exist).  The replacement assertions live in
+  `tests/test_cli.rs` (`test_no_format_flag_in_help` /
+  `test_format_flag_rejected_by_clap` /
+  `test_help_mentions_ct_print`) and the equivalent `--help` greps
+  live in `tests/verify-cli-convention-no-silent-skip.sh`.
+* `tests/test_tracer.rs::run_tracer_on_file` and
+  `test_ton_cli_record` rewritten to drop the
+  `TraceEventsFileFormat::Ctfs` argument and the `--format ctfs`
+  flag; the CLI test invokes
+  `CARGO_BIN_EXE_codetracer-ton-recorder` directly so the test
+  exercises the binary that callers ship.
+
+### New artefacts
+
+* `Justfile` — standard `build` / `test` / `lint` /
+  `verify-cli-convention` / `format` recipes.  `lint` and `test`
+  both run `tests/verify-cli-convention-no-silent-skip.sh`.
+* `tests/verify-cli-convention-no-silent-skip.sh` — shell-side
+  verification that `--format` is absent from `--help` at all four
+  levels (top + record + trace-sandbox + replay), `--out-dir` /
+  `--version` / `ct print` are present where the convention requires
+  them, and the two env vars are referenced in `src/`.  Wired into
+  `just lint` and `just test`.
+
+### Verification
+
+```
+export LIBRARY_PATH=$(nix eval --raw nixpkgs#zstd.out)/lib   # local libzstd workaround
+cd /home/zahary/metacraft/codetracer-ton-recorder
+cargo test --locked              # 68 lib + 10 cli + 3 audit + 7 tracer = 88 active passing
+bash tests/verify-cli-convention-no-silent-skip.sh   # 17 ok lines, 0 fails
+```
+
+`tests/test_cli.rs::test_recorded_trace_via_ct_print_json` runs
+end-to-end (does not skip) inside the metacraft workspace where
+`../codetracer-trace-format-nim/ct-print` exists.
+
+### Recorder-CLI-Conventions.md
+
+The Implementation Status table now lists Ton as `✓ Compliant
+(CTFS-only)` with the standard env-var notes.

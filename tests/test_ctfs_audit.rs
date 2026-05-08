@@ -4,11 +4,22 @@
 //! (AUDIT-CTFS-2026-05.md, isonim-migration.txt §1.57) closed.
 //! Pre-fix versions of these tests would have failed; post-fix they
 //! stay green.
+//!
+//! History note: pre-2026-05-08 this file also contained two tests
+//! (`ctfs_format_advertised_in_record_help` and
+//! `ctfs_format_advertised_in_replay_and_sandbox_help`) that asserted
+//! `<sub> --help` listed `ctfs` as a `--format` value with `[default:
+//! ctfs]`.  The 2026-05-08 convention-compliance pass removed the
+//! `--format` flag entirely (recorder is CTFS-only); the replacement
+//! assertions live in `tests/test_cli.rs`
+//! (`test_no_format_flag_in_help`, `test_help_mentions_ct_print`,
+//! `test_format_flag_rejected_by_clap`).  See `AUDIT-CTFS-2026-05.md`
+//! ("Convention compliance follow-up — 2026-05-08") for the full
+//! record.
 
 use std::path::PathBuf;
-use std::process::Command;
 
-use codetracer_trace_writer_nim::{NimTraceReaderHandle, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::NimTraceReaderHandle;
 
 /// Canonical CodeTracer multi-stream (CTFS) container magic bytes.
 ///
@@ -74,20 +85,16 @@ fn string_from_json_byte_array(value: &serde_json::Value) -> String {
 ///
 /// Pre-fix the CLI's `--format` flag had no `ctfs` value, so the
 /// canonical container was unreachable from the CLI.  Post-fix the
-/// flag accepts `ctfs` and defaults to it; the produced file starts
-/// with the CTFS magic bytes and is materially populated.
+/// recorder is CTFS-only; the produced file starts with the CTFS magic
+/// bytes and is materially populated.
 #[test]
 fn ctfs_writer_produces_ct_container() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp.path().join("traces");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    codetracer_ton_recorder::recorder::record(
-        &fixture_path(),
-        &out_dir,
-        TraceEventsFileFormat::Ctfs,
-    )
-    .expect("record should succeed");
+    codetracer_ton_recorder::recorder::record(&fixture_path(), &out_dir)
+        .expect("record should succeed");
 
     let ct_path = locate_ct_file(&out_dir);
     let bytes = std::fs::read(&ct_path).expect("read .ct");
@@ -101,57 +108,6 @@ fn ctfs_writer_produces_ct_container() {
         &CTFS_MAGIC,
         "CTFS magic bytes mismatch at {ct_path:?}",
     );
-}
-
-/// Audit (a): `record --help` advertises `ctfs` as a valid `--format`
-/// value with `[default: ctfs]`.
-///
-/// Same idiom as Flow 1.52 / Fuel 1.53 / PolkaVM 1.55 / Miden 1.56:
-/// catches accidental defaults regressions at the CLI surface.
-#[test]
-fn ctfs_format_advertised_in_record_help() {
-    let bin = env!("CARGO_BIN_EXE_codetracer-ton-recorder");
-    let output = Command::new(bin)
-        .args(["record", "--help"])
-        .output()
-        .expect("failed to run record --help");
-    assert!(
-        output.status.success(),
-        "record --help should succeed; stderr: {}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let help = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        help.contains("ctfs"),
-        "record --help should advertise the ctfs format; help text:\n{help}",
-    );
-    assert!(
-        help.contains("[default: ctfs]"),
-        "record --help should show ctfs as the default; help text:\n{help}",
-    );
-}
-
-/// Audit (a): `replay --help` and `trace-sandbox --help` also default
-/// to `ctfs`.  Same default-format gap, same fix surface.
-#[test]
-fn ctfs_format_advertised_in_replay_and_sandbox_help() {
-    let bin = env!("CARGO_BIN_EXE_codetracer-ton-recorder");
-    for sub in ["replay", "trace-sandbox"] {
-        let output = Command::new(bin)
-            .args([sub, "--help"])
-            .output()
-            .unwrap_or_else(|e| panic!("failed to run {sub} --help: {e}"));
-        assert!(
-            output.status.success(),
-            "{sub} --help should succeed; stderr: {}",
-            String::from_utf8_lossy(&output.stderr),
-        );
-        let help = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            help.contains("[default: ctfs]"),
-            "{sub} --help should default to ctfs; help text:\n{help}",
-        );
-    }
 }
 
 /// Audit (c): the call-arg staging path introduced in this audit
@@ -172,12 +128,8 @@ fn call_arg_staging_does_not_empty_trace() {
     let out_dir = tmp.path().join("traces");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    codetracer_ton_recorder::recorder::record(
-        &fixture_path(),
-        &out_dir,
-        TraceEventsFileFormat::Ctfs,
-    )
-    .expect("record should succeed");
+    codetracer_ton_recorder::recorder::record(&fixture_path(), &out_dir)
+        .expect("record should succeed");
 
     let ct_path = locate_ct_file(&out_dir);
     let bytes = std::fs::read(&ct_path).expect("read .ct");
@@ -211,13 +163,8 @@ action: SENDRAWMSG mode=3 dst=EQDabc value=100 body=0xdeadbeef
     std::fs::write(&source_path, "fun main(): int {\n    return 1;\n}\n").expect("write source");
 
     let out_dir = tmp.path().join("traces");
-    codetracer_ton_recorder::sandbox::trace_sandbox(
-        &log_path,
-        &source_path,
-        &out_dir,
-        TraceEventsFileFormat::Ctfs,
-    )
-    .expect("trace sandbox log");
+    codetracer_ton_recorder::sandbox::trace_sandbox(&log_path, &source_path, &out_dir)
+        .expect("trace sandbox log");
 
     let events = read_events(&out_dir);
     let event = events

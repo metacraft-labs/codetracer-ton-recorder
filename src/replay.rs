@@ -20,6 +20,13 @@ use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
 
+// The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
+// `codetracer-specs`).  We pin every `create_trace_writer` call site to
+// this constant so the replay surface no longer carries a `format`
+// parameter and the writer cannot accidentally drift away from the
+// canonical multi-stream container.
+const CTFS_FORMAT: TraceEventsFileFormat = TraceEventsFileFormat::Ctfs;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -149,11 +156,7 @@ pub fn parse_boc(bytes: &[u8]) -> Result<Vec<u8>> {
 ///
 /// In the current milestone, step 1 uses mock/placeholder data when
 /// real Liteserver access is unavailable.
-pub fn replay_transaction(
-    config: &ReplayConfig,
-    out_dir: &Path,
-    format: TraceEventsFileFormat,
-) -> Result<()> {
+pub fn replay_transaction(config: &ReplayConfig, out_dir: &Path) -> Result<()> {
     eprintln!(
         "Replaying transaction {} on contract {}",
         config.tx_hash, config.address
@@ -179,7 +182,7 @@ pub fn replay_transaction(
         }
     };
 
-    // -- 2. Set up trace writer --
+    // -- 2. Set up trace writer (CTFS only) --
     let source_label = config
         .source_dir
         .as_ref()
@@ -191,18 +194,13 @@ pub fn replay_transaction(
         .as_deref()
         .unwrap_or_else(|| Path::new("contract.tolk"));
 
-    let mut writer = create_trace_writer(&source_label, &[], format);
+    let mut writer = create_trace_writer(&source_label, &[], CTFS_FORMAT);
 
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-    let events_filename = match format {
-        TraceEventsFileFormat::Json => "trace.json",
-        TraceEventsFileFormat::Binary
-        | TraceEventsFileFormat::BinaryV0
-        | TraceEventsFileFormat::Ctfs => "trace.bin",
-    };
-    let events_path = out_dir.join(events_filename);
+    // CTFS-only writer — events stream lives in `trace.bin`.
+    let events_path = out_dir.join("trace.bin");
     let metadata_path = out_dir.join("trace_metadata.json");
     let paths_path = out_dir.join("trace_paths.json");
 
@@ -393,7 +391,7 @@ mod tests {
             source_dir: None,
         };
         let tmp = tempfile::tempdir().unwrap();
-        let result = replay_transaction(&config, tmp.path(), TraceEventsFileFormat::Json);
+        let result = replay_transaction(&config, tmp.path());
         // Should fail because Liteserver is not implemented yet.
         assert!(result.is_err());
     }

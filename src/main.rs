@@ -7,33 +7,74 @@
 //! # Usage
 //!
 //! ```text
-//! codetracer-ton-recorder record <tolk-file> \
-//!     --out-dir <output-dir> \
-//!     [--format ctfs|binary|json]
+//! codetracer-ton-recorder record <tolk-file> --out-dir <output-dir>
+//! codetracer-ton-recorder trace-sandbox --vm-log <log> --out-dir <output-dir>
+//! codetracer-ton-recorder replay --tx-hash <hash> --address <addr> --out-dir <output-dir>
 //! ```
 //!
-//! The default output format is `ctfs` -- the canonical CodeTracer
-//! multi-stream container that the Nim `ct_reader_*` FFI and the
-//! db-backend's `CTFSTraceReader` consume directly.  `binary`
-//! (legacy CBOR + Zstd) and `json` (human-readable) are kept for
-//! compatibility / debugging.
+//! The recorder always writes traces in the canonical CodeTracer
+//! multi-stream CTFS format (see `Recorder-CLI-Conventions.md` §4 in
+//! `codetracer-specs`).  No `--format` flag is exposed: human-readable
+//! conversion is handled out-of-band by `ct print` (shipped with
+//! `codetracer-trace-format-nim`).
+//!
+//! # Environment variables
+//!
+//! * `CODETRACER_TON_RECORDER_OUT_DIR` — fallback for `--out-dir` when the
+//!   flag is not given. The CLI flag always wins.
+//! * `CODETRACER_TON_RECORDER_DISABLED` — set to `1` or `true` to skip
+//!   recording entirely. The recorder still validates its inputs (where
+//!   applicable) and propagates a clean exit code.
+//! * `CODETRACER_TON_RECORDER_LOG_LEVEL` — recorder log verbosity
+//!   (advisory; the TON recorder currently logs to stderr unconditionally).
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
+use clap::{Parser, Subcommand};
 use eyre::{Context, Result};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Environment variable used as a fallback for `--out-dir` when the CLI
+/// flag is omitted.  Convention: see `Recorder-CLI-Conventions.md` §5.
+const ENV_OUT_DIR: &str = "CODETRACER_TON_RECORDER_OUT_DIR";
+
+/// Environment variable that, when set to `1`/`true`, disables tracing
+/// entirely — the recorder runs as a transparent pass-through.
+const ENV_DISABLED: &str = "CODETRACER_TON_RECORDER_DISABLED";
+
+/// Default output directory used when neither `--out-dir` nor
+/// `CODETRACER_TON_RECORDER_OUT_DIR` is set.
+const DEFAULT_OUT_DIR: &str = "./ct-traces/";
 
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
 
-/// CodeTracer Tolk/TON recorder -- record Tolk program execution traces.
+/// CodeTracer Tolk/TON recorder — record Tolk program execution traces.
+///
+/// Traces are always written in the canonical CTFS multi-stream format.
+/// To convert a recorded `.ct` bundle to JSON / text for inspection, use
+/// `ct print` from `codetracer-trace-format-nim`.
 #[derive(Debug, Parser)]
 #[command(
     name = "codetracer-ton-recorder",
     version,
-    about = "Record Tolk/TON program execution traces for CodeTracer"
+    about = "Record Tolk/TON program execution traces for CodeTracer (CTFS-only). \
+             Use `ct print` from codetracer-trace-format-nim for human-readable conversion.",
+    long_about = "Record Tolk/TON program execution traces for CodeTracer.\n\
+                  \n\
+                  Output is always written in the canonical CodeTracer CTFS\n\
+                  multi-stream format. Use `ct print` (shipped with the\n\
+                  codetracer-trace-format-nim sibling) to convert a recorded\n\
+                  `.ct` bundle to JSON or other human-readable forms.\n\
+                  \n\
+                  Environment variables:\n\
+                    CODETRACER_TON_RECORDER_OUT_DIR    fallback for --out-dir\n\
+                    CODETRACER_TON_RECORDER_DISABLED   set to 1/true to skip recording\n\
+                    CODETRACER_TON_RECORDER_LOG_LEVEL  log verbosity (advisory)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,7 +86,7 @@ enum Commands {
     /// Record execution of a Tolk program.
     ///
     /// Parses the given .tolk source file, evaluates function bodies,
-    /// captures the execution trace, and writes CodeTracer trace files
+    /// captures the execution trace, and writes a CTFS trace bundle
     /// to `--out-dir`.
     Record(RecordArgs),
 
@@ -55,59 +96,11 @@ enum Commands {
     /// Replay an on-chain TON transaction and produce a CodeTracer trace.
     ///
     /// Fetches the transaction and contract state from a Liteserver,
-    /// re-executes the TVM computation, and writes trace output files.
+    /// re-executes the TVM computation, and writes a CTFS trace bundle.
     Replay(ReplayArgs),
 
     /// Print version information.
     Version,
-}
-
-/// Output format for the trace files.
-///
-/// `Ctfs` is the canonical CodeTracer multi-stream container (the
-/// format the Nim `ct_reader_*` FFI and the db-backend's
-/// `CTFSTraceReader` consume directly) and is the default.  `Binary`
-/// is the legacy CBOR + Zstd container kept for compatibility with
-/// older readers.  `Json` is a slower, human-readable form useful
-/// for debugging.
-///
-/// Same shape as the audited recorders (EVM 1.39, Solana 1.44, Move
-/// 1.46, Cardano 1.48, Cairo 1.50, Flow 1.52, Fuel 1.53, PolkaVM
-/// 1.55, Miden 1.56) so `From<OutputFormat>` collapses each
-/// dispatch site to `args.format.into()`.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum OutputFormat {
-    /// Canonical CodeTracer multi-stream container (recommended; default).
-    Ctfs,
-    /// Legacy CBOR + Zstd binary format.
-    Binary,
-    /// Human-readable JSON (slower; useful for debugging).
-    Json,
-}
-
-impl From<OutputFormat> for TraceEventsFileFormat {
-    fn from(fmt: OutputFormat) -> Self {
-        match fmt {
-            OutputFormat::Ctfs => TraceEventsFileFormat::Ctfs,
-            OutputFormat::Binary => TraceEventsFileFormat::Binary,
-            OutputFormat::Json => TraceEventsFileFormat::Json,
-        }
-    }
-}
-
-impl OutputFormat {
-    /// Stable string representation suitable for `trace_metadata.json`'s
-    /// `format` field.  Wired here for forward compatibility with the
-    /// audit-aligned metadata emission path used by other recorders;
-    /// not yet consumed by the writer plumbing in this crate.
-    #[allow(dead_code)]
-    fn as_str(self) -> &'static str {
-        match self {
-            OutputFormat::Ctfs => "ctfs",
-            OutputFormat::Binary => "binary",
-            OutputFormat::Json => "json",
-        }
-    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -117,13 +110,11 @@ struct RecordArgs {
 
     /// Directory where the trace files will be written.
     ///
-    /// The directory will be created if it does not exist.
-    #[arg(short = 'o', long, default_value = "./ct-traces/")]
-    out_dir: PathBuf,
-
-    /// Output format for the trace data.
-    #[arg(short = 'f', long, default_value = "ctfs")]
-    format: OutputFormat,
+    /// The directory will be created if it does not exist.  Falls back to
+    /// the `CODETRACER_TON_RECORDER_OUT_DIR` environment variable when
+    /// the flag is omitted.
+    #[arg(short = 'o', long)]
+    out_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -145,12 +136,11 @@ struct ReplayArgs {
     source_dir: Option<PathBuf>,
 
     /// Directory where the trace files will be written.
-    #[arg(short = 'o', long, default_value = "./ct-traces/")]
-    out_dir: PathBuf,
-
-    /// Output format for the trace data.
-    #[arg(short = 'f', long, default_value = "ctfs")]
-    format: OutputFormat,
+    ///
+    /// Falls back to the `CODETRACER_TON_RECORDER_OUT_DIR` environment
+    /// variable when the flag is omitted.
+    #[arg(short = 'o', long)]
+    out_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -164,12 +154,44 @@ struct TraceSandboxArgs {
     source: PathBuf,
 
     /// Directory where the trace files will be written.
-    #[arg(short = 'o', long, default_value = "./ct-traces/")]
-    out_dir: PathBuf,
+    ///
+    /// Falls back to the `CODETRACER_TON_RECORDER_OUT_DIR` environment
+    /// variable when the flag is omitted.
+    #[arg(short = 'o', long)]
+    out_dir: Option<PathBuf>,
+}
 
-    /// Output format for the trace data.
-    #[arg(short = 'f', long, default_value = "ctfs")]
-    format: OutputFormat,
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve the effective output directory:
+///   1. `--out-dir` if given on the CLI.
+///   2. `CODETRACER_TON_RECORDER_OUT_DIR` env var.
+///   3. `DEFAULT_OUT_DIR` ("./ct-traces/").
+fn resolve_out_dir(cli_out_dir: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = cli_out_dir {
+        return path;
+    }
+    if let Some(value) = std::env::var_os(ENV_OUT_DIR) {
+        if !value.is_empty() {
+            return PathBuf::from(value);
+        }
+    }
+    PathBuf::from(DEFAULT_OUT_DIR)
+}
+
+/// Whether the recorder is disabled via env var.  When true, the CLI
+/// must execute its target operation in pass-through mode without
+/// emitting any trace artefacts.
+fn recording_disabled() -> bool {
+    match std::env::var(ENV_DISABLED) {
+        Ok(value) => {
+            let v = value.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,15 +225,21 @@ fn record(args: RecordArgs) -> Result<()> {
 
     eprintln!("Source file: {}", source_path.display());
 
-    let format: TraceEventsFileFormat = args.format.into();
+    if recording_disabled() {
+        // Pass-through: the TON recorder doesn't run a separate target
+        // process — it parses & evaluates the Tolk source itself — so
+        // disabling recording simply means "don't emit any trace artefacts".
+        eprintln!("{ENV_DISABLED} is set; skipping trace recording (no output written).");
+        return Ok(());
+    }
 
-    // 2. Create the output directory
-    let out_dir = &args.out_dir;
-    std::fs::create_dir_all(out_dir)
+    // 2. Resolve and create the output directory
+    let out_dir = resolve_out_dir(args.out_dir);
+    std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-    // 3. Run the recorder
-    codetracer_ton_recorder::recorder::record(&source_path, out_dir, format)?;
+    // 3. Run the recorder (CTFS only)
+    codetracer_ton_recorder::recorder::record(&source_path, &out_dir)?;
 
     eprintln!("Trace files written to {}", out_dir.display());
 
@@ -220,8 +248,6 @@ fn record(args: RecordArgs) -> Result<()> {
 
 /// Execute the `replay` subcommand.
 fn replay(args: ReplayArgs) -> Result<()> {
-    let format: TraceEventsFileFormat = args.format.into();
-
     let config = codetracer_ton_recorder::replay::ReplayConfig {
         tx_hash: args.tx_hash,
         address: args.address,
@@ -229,9 +255,18 @@ fn replay(args: ReplayArgs) -> Result<()> {
         source_dir: args.source_dir,
     };
 
-    codetracer_ton_recorder::replay::replay_transaction(&config, &args.out_dir, format)?;
+    if recording_disabled() {
+        eprintln!("{ENV_DISABLED} is set; skipping replay recording (no output written).");
+        return Ok(());
+    }
 
-    eprintln!("Replay trace files written to {}", args.out_dir.display());
+    let out_dir = resolve_out_dir(args.out_dir);
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
+
+    codetracer_ton_recorder::replay::replay_transaction(&config, &out_dir)?;
+
+    eprintln!("Replay trace files written to {}", out_dir.display());
     Ok(())
 }
 
@@ -244,12 +279,17 @@ fn trace_sandbox(args: TraceSandboxArgs) -> Result<()> {
 
     eprintln!("VM log file: {}", vm_log_path.display());
 
-    let format: TraceEventsFileFormat = args.format.into();
+    if recording_disabled() {
+        eprintln!("{ENV_DISABLED} is set; skipping trace recording (no output written).");
+        return Ok(());
+    }
 
     let source_path = &args.source;
-    let out_dir = &args.out_dir;
+    let out_dir = resolve_out_dir(args.out_dir);
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-    codetracer_ton_recorder::sandbox::trace_sandbox(&vm_log_path, source_path, out_dir, format)?;
+    codetracer_ton_recorder::sandbox::trace_sandbox(&vm_log_path, source_path, &out_dir)?;
 
     eprintln!("Trace files written to {}", out_dir.display());
 
