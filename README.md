@@ -20,22 +20,29 @@ cargo build
 Record a trace from a Tolk source file:
 
 ```bash
-codetracer-ton-recorder record <tolk-file> --out-dir <dir> [--format binary|json]
-# Produces trace files in <dir>.
-# --format selects the output format (defaults to binary).
+codetracer-ton-recorder record <tolk-file> --out-dir <dir>
+# Produces a CTFS multi-stream `.ct` bundle plus trace_metadata.json /
+# trace_paths.json in <dir>.
 ```
 
 Parse and trace from `@ton/sandbox` vm_logs_full output:
 
 ```bash
-codetracer-ton-recorder trace-sandbox <vm-log-file> --out-dir <dir> [--format binary|json]
+codetracer-ton-recorder trace-sandbox --vm-log <vm-log-file> --out-dir <dir>
 ```
 
 Replay an on-chain transaction:
 
 ```bash
-codetracer-ton-recorder replay <tx-hash> --out-dir <dir> [--format binary|json]
+codetracer-ton-recorder replay --tx-hash <hash> --address <addr> --out-dir <dir>
 ```
+
+The recorder always writes traces in the canonical CodeTracer CTFS
+multi-stream format (see
+[`Recorder-CLI-Conventions.md`](https://github.com/metacraft-labs/codetracer-specs)
+§4). To convert a recorded `.ct` bundle to JSON or text for
+inspection, use `ct print` (shipped with
+[`codetracer-trace-format-nim`](https://github.com/metacraft-labs/codetracer-trace-format-nim)).
 
 However, you probably want to use it in combination with CodeTracer, which would be released soon.
 
@@ -61,6 +68,9 @@ cargo test
 
 ### Environment variables
 
+* `CODETRACER_TON_RECORDER_OUT_DIR` — fallback for `--out-dir` when the flag is omitted (convention: `Recorder-CLI-Conventions.md` §5)
+* `CODETRACER_TON_RECORDER_DISABLED` — set to `1` or `true` to skip recording entirely (the recorder still validates inputs and exits cleanly)
+* `CODETRACER_TON_RECORDER_LOG_LEVEL` — recorder log verbosity (advisory)
 * `RUST_LOG` — controls log verbosity (standard `env_logger` syntax, e.g. `RUST_LOG=debug`)
 
 ### Contributing

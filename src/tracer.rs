@@ -16,6 +16,13 @@ use eyre::{eyre, Context, Result};
 use crate::source_map::SourceMap;
 use crate::stack_tracker::{self, StackTracker};
 
+// The recorder is CTFS-only per `Recorder-CLI-Conventions.md` §4 (see
+// `codetracer-specs`).  We pin every `create_trace_writer` call site to
+// this constant so the tracer surface no longer carries a `format`
+// parameter and the writer cannot accidentally drift away from the
+// canonical multi-stream container.
+const CTFS_FORMAT: TraceEventsFileFormat = TraceEventsFileFormat::Ctfs;
+
 // ---------------------------------------------------------------------------
 // Tolk AST types
 // ---------------------------------------------------------------------------
@@ -67,23 +74,19 @@ impl TolkTracer {
     /// 1. Parses the source file for function definitions.
     /// 2. Evaluates function bodies starting from `main()` via the real TVM.
     /// 3. Emits Step events at source lines and Value events with variable values.
-    /// 4. Writes trace.json/trace.bin (depending on format), trace_metadata.json, trace_paths.json.
-    pub fn trace_program(
-        source_path: &Path,
-        source_code: &str,
-        out_dir: &Path,
-        format: TraceEventsFileFormat,
-    ) -> Result<()> {
+    /// 4. Writes a CTFS multi-stream `.ct` bundle plus `trace_metadata.json`
+    ///    and `trace_paths.json` to `out_dir`.
+    pub fn trace_program(source_path: &Path, source_code: &str, out_dir: &Path) -> Result<()> {
         // -- 1. Parse the Tolk source --
         let _source_map = SourceMap::from_source(source_path, source_code);
         let functions = parse_functions(source_code);
 
         eprintln!("Parsed {} functions", functions.len());
 
-        // -- 2. Create the trace writer --
+        // -- 2. Create the trace writer (CTFS only) --
         let program_str = source_path.to_string_lossy();
         let mut tracer = TolkTracer {
-            writer: create_trace_writer(&program_str, &[], format),
+            writer: create_trace_writer(&program_str, &[], CTFS_FORMAT),
             type_ids: HashMap::new(),
         };
 
@@ -91,13 +94,8 @@ impl TolkTracer {
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("cannot create output dir: {}", out_dir.display()))?;
 
-        let events_filename = match format {
-            TraceEventsFileFormat::Json => "trace.json",
-            TraceEventsFileFormat::Binary
-            | TraceEventsFileFormat::BinaryV0
-            | TraceEventsFileFormat::Ctfs => "trace.bin",
-        };
-        let events_path = out_dir.join(events_filename);
+        // CTFS-only writer — events stream lives in `trace.bin`.
+        let events_path = out_dir.join("trace.bin");
         let metadata_path = out_dir.join("trace_metadata.json");
         let paths_path = out_dir.join("trace_paths.json");
 
