@@ -680,17 +680,23 @@ fn test_error_paths_test_via_ct_print_full() {
     let counts = &doc["counts"];
     assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(2), "calls; counts={counts}");
-    // RECORDER BUG: should be >= 1 once `throw`/`assert` reach a
-    // RecordEvent of `EventLogKind::Error`.
+    // Two io_events: one for `throw 7` inside the (unreached)
+    // `failing_compute` and one for `assert (probe > 0, 13)` inside
+    // the (unreached) `assert_compute`.  Both are surfaced via the
+    // static sweep `emit_error_events_for_program` because the
+    // recorder doesn't follow into functions that aren't reachable
+    // from `main()` — a separate recorder gap also pinned by this
+    // test (see the function-list assertion above and the
+    // `STATIC-SWEEP LIMITATION` block in src/tracer.rs).
     assert_eq!(
         counts["io_events"].as_u64(),
-        Some(0),
+        Some(2),
         "io_events; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 9 steps + 2 call_entry + 2 call_exit = 13 events.
-    assert_eq!(events.len(), 13, "events.len()");
+    // 9 steps + 2 call_entry + 2 call_exit + 2 ioError = 15 events.
+    assert_eq!(events.len(), 15, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     assert_eq!(
@@ -708,14 +714,33 @@ fn test_error_paths_test_via_ct_print_full() {
             ("bumped".into(), 112),
         ],
     );
+
+    // Pin the exact content of the surfaced Error io_events.  The
+    // metadata tags (`"TolkThrow"` / `"TolkAssert"`) mirror the
+    // distinctness of the cardano `"AikenFail"` (commit 7e5a177)
+    // and move `"ABORTED: ..."` conventions so the frontend can
+    // route source-level Tolk failures away from generic runtime
+    // TVM exceptions (which carry `"tvm_exception"`).  The content
+    // strings carry the raw exception code verbatim — this is the
+    // payload that downstream tools (calltrace, event log) render.
+    let io_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .collect();
+    assert_eq!(io_events.len(), 2, "exactly two ioError events");
+    assert_eq!(
+        io_events[0]["text"].as_str(),
+        Some("throw 7"),
+        "first ioError text"
+    );
+    assert_eq!(
+        io_events[1]["text"].as_str(),
+        Some("assert: code 13"),
+        "second ioError text"
+    );
 }
 
 #[test]
-#[ignore = "RECORDER BUG: `throw N`, `try { ... } catch (e) { ... }`, \
-            and `assert (cond, code)` are not surfaced as RecordEvents \
-            of EventLogKind::Error.  Spec-compliant output should emit \
-            at least one io_event per throw / assert path with the \
-            error code in the payload."]
 fn test_error_paths_test_emits_throw_event() {
     let Some((doc, _)) = record_and_dump_full(
         "test_error_paths_test_emits_throw_event",

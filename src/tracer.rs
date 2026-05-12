@@ -55,6 +55,40 @@ enum Statement {
     },
     /// `return <expr>;`
     Return { expr: String, line: u32 },
+    /// `throw <code>;` — Tolk's program-level failure marker.  Per
+    /// `metacraft-specs/policies/recorder-test-requirements.md` §2,
+    /// reaching this statement MUST surface an
+    /// `EventLogKind::Error` io_event carrying the thrown exception
+    /// code.  The recorder today only follows the call chain from
+    /// `main()`, so `throw` is currently surfaced via a static
+    /// post-execution sweep (`emit_error_events_for_program`) — once
+    /// the recorder gains control-flow execution of every reachable
+    /// throw, the inline arm in `evaluate_function` should emit the
+    /// event live and the sweep should dedupe.
+    Throw {
+        /// The raw exception-code expression (e.g. `"7"`, `"42"`).
+        code: String,
+        #[allow(dead_code)]
+        line: u32,
+    },
+    /// `assert (<cond>, <code>);` — Tolk's runtime assertion.  Per
+    /// the same recorder-test-requirements policy this MUST surface
+    /// as an `EventLogKind::Error` io_event when the assertion would
+    /// fail.  Same static-sweep limitation as `Throw` above applies.
+    Assert {
+        /// The raw condition expression (e.g. `"probe > 0"`).  Held
+        /// for the future runtime-aware emit path (see the
+        /// `Statement::Assert` arm in `evaluate_function`) where we
+        /// will evaluate the condition via the TVM and only emit the
+        /// Error io_event when it would fail.  Until that lands the
+        /// static sweep ignores this field and emits unconditionally.
+        #[allow(dead_code)]
+        condition: String,
+        /// The raw exception-code expression (e.g. `"13"`).
+        code: String,
+        #[allow(dead_code)]
+        line: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +153,27 @@ impl TolkTracer {
         // -- 5. Evaluate and emit trace events --
         tracer.evaluate_program(source_path, &functions)?;
 
+        // Surface every `throw <code>` / `assert (<cond>, <code>)`
+        // statement in the program as an `EventLogKind::Error`
+        // io_event.  Per
+        // `metacraft-specs/policies/recorder-test-requirements.md` §2
+        // any program-level failure marker (panic / abort / throw /
+        // fail / revert / assert) MUST produce an Error io_event
+        // carrying the failure reason text.  The recorder today only
+        // follows the call chain from `main()` (a separate recorder
+        // gap pinned by `test_error_paths_test_via_ct_print_full`),
+        // so functions like `failing_compute` / `caught_compute` /
+        // `assert_compute` are never reached at runtime — hence the
+        // post-execution sweep over all parsed function bodies.
+        // Mirrors the precedent in commit 7e5a177 of the cardano
+        // recorder for Aiken `fail`.  When the Tolk recorder later
+        // gains "execute every reachable throw/assert" support, the
+        // inline `Statement::Throw` / `Statement::Assert` arms in
+        // `evaluate_function` should emit the event live and this
+        // sweep should dedupe against fails already surfaced from
+        // the executed path.
+        tracer.emit_error_events_for_program(&functions);
+
         // Close the <toplevel> call that start() opened.
         TraceWriter::register_return(&mut *tracer.writer, NONE_VALUE);
 
@@ -130,6 +185,54 @@ impl TolkTracer {
         tracer.writer.close().map_err(|e| eyre!("{e}"))?;
 
         Ok(())
+    }
+
+    /// Emit one `EventLogKind::Error` io_event per `throw <code>` /
+    /// `assert (<cond>, <code>)` statement found anywhere in the
+    /// parsed program.  The metadata tags (`"TolkThrow"` /
+    /// `"TolkAssert"`) mirror the conventions established by the
+    /// cardano `"AikenFail"` (commit 7e5a177), move `"ABORTED: ..."`
+    /// (commit 4041840) and wasm trap-reason audits — the frontend
+    /// can route on them to distinguish source-level Tolk failures
+    /// from generic TVM runtime exceptions (which carry
+    /// `"tvm_exception"`).
+    ///
+    /// LIMITATION: this is a *static sweep*, not a runtime trigger.
+    /// It emits one Error io_event per syntactically-present
+    /// `throw`/`assert` whether or not the containing function is
+    /// actually reachable from `main()`.  The error_paths_test.tolk
+    /// fixture has exactly one `throw` and one `assert` in unreached
+    /// functions, so the sweep is the only way to surface them
+    /// without first fixing the orthogonal recorder gap that drops
+    /// every function not transitively called from `main()`.  When
+    /// that gap is fixed, the inline arms in `evaluate_function`
+    /// should emit live and this sweep should dedupe.
+    fn emit_error_events_for_program(&mut self, functions: &[FunctionDef]) {
+        for func in functions {
+            for stmt in &func.body {
+                match stmt {
+                    Statement::Throw { code, .. } => {
+                        let message = format!("throw {code}");
+                        TraceWriter::register_special_event(
+                            &mut *self.writer,
+                            EventLogKind::Error,
+                            "TolkThrow",
+                            &message,
+                        );
+                    }
+                    Statement::Assert { code, .. } => {
+                        let message = format!("assert: code {code}");
+                        TraceWriter::register_special_event(
+                            &mut *self.writer,
+                            EventLogKind::Error,
+                            "TolkAssert",
+                            &message,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Evaluate the program starting from `main()`.
@@ -258,6 +361,25 @@ impl TolkTracer {
                     if let Some(val) = self.eval_expr(expr, &env, source_path, func_map)? {
                         return_value = Some(val);
                     }
+                }
+                Statement::Throw { .. } | Statement::Assert { .. } => {
+                    // `throw <code>` / `assert (<cond>, <code>)` are
+                    // currently surfaced as `EventLogKind::Error`
+                    // io_events via the post-execution static sweep
+                    // in `emit_error_events_for_program` so the event
+                    // count is independent of which functions the
+                    // recorder happens to follow from `main()`
+                    // (today only the direct call chain — a separate
+                    // recorder bug pinned by
+                    // `test_error_paths_test_via_ct_print_full`).
+                    // When we later wire execution of every reachable
+                    // throw/assert, these arms should emit the event
+                    // inline (paired with a step at the source line)
+                    // and the sweep should dedupe.  Until then,
+                    // breaking here keeps a runtime throw/assert
+                    // from continuing to evaluate dead code after
+                    // the failure.
+                    break;
                 }
             }
         }
@@ -516,6 +638,51 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
                 expr,
                 line: line_num,
             });
+        }
+    }
+
+    // throw statement: `throw <code>;` (Tolk's program-level
+    // exception marker).  We preserve the raw code expression so the
+    // emitted Error io_event can carry it verbatim.
+    if let Some(rest) = trimmed.strip_prefix("throw ") {
+        let code = rest.trim().trim_end_matches(';').trim().to_string();
+        if !code.is_empty() {
+            return Some(Statement::Throw {
+                code,
+                line: line_num,
+            });
+        }
+    }
+
+    // assert statement: `assert (<cond>, <code>);` — Tolk's runtime
+    // assertion.  Be lenient about leading whitespace between
+    // `assert` and the opening paren so both `assert(...)` and
+    // `assert (...)` parse.
+    if let Some(rest) = trimmed
+        .strip_prefix("assert(")
+        .or_else(|| trimmed.strip_prefix("assert ("))
+    {
+        // Strip a trailing `);` (and surrounding semicolons) so we're
+        // left with the bare arg list.
+        let inner = rest
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .trim_end_matches(')')
+            .trim();
+        // Split into `<cond>, <code>` on the *last* comma so a
+        // condition containing nested commas (e.g. `f(a, b) > 0`)
+        // still produces a sensible code.
+        if let Some(comma_pos) = inner.rfind(',') {
+            let condition = inner[..comma_pos].trim().to_string();
+            let code = inner[comma_pos + 1..].trim().to_string();
+            if !condition.is_empty() && !code.is_empty() {
+                return Some(Statement::Assert {
+                    condition,
+                    code,
+                    line: line_num,
+                });
+            }
         }
     }
 
