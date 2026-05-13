@@ -1193,6 +1193,876 @@ fn test_cell_ops_test_storage_io_events() {
     assert_eq!(loaded, vec![42, 99]);
 }
 
+// --- arg_passing_test.tolk -------------------------------------------------
+
+/// Records `arg_passing_test.tolk` and pins the full ct-print
+/// `--full` shape now that the recorder threads positional argument
+/// expressions through every call site (see the cardano `a393608`
+/// pattern adapted in `src/tracer.rs::evaluate_function` /
+/// `eval_expr` / `eval_expr_to_value`).  Pre-M10 the parser only
+/// recognised bare zero-arg `name()` shapes; every multi-arg call
+/// dropped on the floor, leaving caller-bindings unevaluated.  This
+/// test guards against the regression by asserting on the full
+/// per-iteration variable trail, the six-call sequence
+/// (`compute -> add -> square -> chain_calls -> add -> square`)
+/// and every helper's return value.
+#[test]
+fn test_arg_passing_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_arg_passing_test_via_ct_print_full",
+        "arg_passing_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "add", "square", "chain_calls"],
+    );
+
+    let counts = &doc["counts"];
+    // 19 steps:
+    //   2 outer (toplevel-line-1 + main dispatch)
+    //   compute (5 var bindings + return) = 6
+    //   add called twice from compute / chain_calls: each call emits a
+    //   per-formal step (line of caller) carrying the bound a/b plus a
+    //   step at line 25 carrying the resulting `sum`, i.e. 2 steps per
+    //   invocation × 2 = 4 steps.
+    //   square called twice (from compute and chain_calls): 2 × 2 = 4 steps.
+    //   chain_calls (2 var bindings + return) = 3
+    //   = 2 + 6 + 4 + 4 + 3 = 19.
+    assert_eq!(counts["steps"].as_u64(), Some(19), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(6), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 19 steps + 6 call_entry + 6 call_exit = 31 events.
+    assert_eq!(events.len(), 31, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    // Call entry order (encountered while walking compute's body in
+    // source order).  add and square each appear twice — once from
+    // compute directly and once inside chain_calls.
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "add".to_string(),
+            "square".to_string(),
+            "chain_calls".to_string(),
+            "add".to_string(),
+            "square".to_string(),
+        ],
+    );
+
+    // Call exit order: innermost first.  Inside chain_calls, add
+    // exits first, then square, then chain_calls; compute closes
+    // last.
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "add".to_string(),
+            "square".to_string(),
+            "add".to_string(),
+            "square".to_string(),
+            "chain_calls".to_string(),
+            "compute".to_string(),
+        ],
+    );
+
+    // Full (varname, value) trail.  This is the key M10-arg-passing
+    // assertion: every callee binding (`a`, `b`, `n`, `seed`,
+    // `doubled`, `squared`) must surface with the resolved actual
+    // value, not as an empty binding or a None placeholder.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            // compute(): base.
+            ("base".into(), 3),
+            // add(base=3, b=4): a=3, b=4, sum=7.
+            ("a".into(), 3),
+            ("b".into(), 4),
+            ("sum".into(), 7),
+            // Bridge binding back in compute: sum = 7.
+            ("sum".into(), 7),
+            // square(base=3): n=3, sq=9.
+            ("n".into(), 3),
+            ("sq".into(), 9),
+            // Bridge binding back in compute: sq = 9.
+            ("sq".into(), 9),
+            // chain_calls(base=3): seed=3.
+            ("seed".into(), 3),
+            // add(seed=3, seed=3): a=3, b=3, sum=6.
+            ("a".into(), 3),
+            ("b".into(), 3),
+            ("sum".into(), 6),
+            // Bridge binding back in chain_calls: doubled = 6.
+            ("doubled".into(), 6),
+            // square(doubled=6): n=6, sq=36.
+            ("n".into(), 6),
+            ("sq".into(), 36),
+            // Bridge binding back in chain_calls: squared = 36.
+            ("squared".into(), 36),
+            // Bridge binding back in compute: chained = 36.
+            ("chained".into(), 36),
+            // Final accumulator: 7 + 9 + 36 = 52.
+            ("combined".into(), 52),
+        ],
+    );
+
+    // Return values, in event-emission (call_exit LIFO) order:
+    //   add -> 7 (from compute)
+    //   square -> 9 (from compute)
+    //   add -> 6 (from chain_calls; seed+seed = 3+3)
+    //   square -> 36 (from chain_calls; doubled^2 = 6^2)
+    //   chain_calls -> 36
+    //   compute -> 52
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![7, 9, 6, 36, 36, 52]);
+
+    // Each call_entry must carry the resolved actuals as `args`
+    // (NOT NONE_VALUE placeholders).  This pins the call-arg
+    // staging path so the calltrace pane's `.call-arg` rows are
+    // populated end-to-end.
+    let entries: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_entry")
+        .collect();
+    // First add invocation: (a=3, b=4).
+    let add_first_args = entries[1]["args"].as_array().expect("args array");
+    assert_eq!(add_first_args.len(), 2);
+    assert_eq!(add_first_args[0]["value"]["i"].as_i64(), Some(3));
+    assert_eq!(add_first_args[1]["value"]["i"].as_i64(), Some(4));
+    // First square invocation: (n=3).
+    let square_first_args = entries[2]["args"].as_array().expect("args array");
+    assert_eq!(square_first_args.len(), 1);
+    assert_eq!(square_first_args[0]["value"]["i"].as_i64(), Some(3));
+    // chain_calls invocation: (seed=3).
+    let chain_args = entries[3]["args"].as_array().expect("args array");
+    assert_eq!(chain_args.len(), 1);
+    assert_eq!(chain_args[0]["value"]["i"].as_i64(), Some(3));
+}
+
+// --- persistent_storage_test.tolk ------------------------------------------
+
+/// Records `persistent_storage_test.tolk` and pins the canonical
+/// Tolk persistent-storage idiom: a `Storage` struct + `load_data()`
+/// / `save_data()` round-trip.  This is the most common real-world
+/// TON contract shape (counter, jetton-wallet, NFT-item, ...) — every
+/// production contract opens with `load_data()`, mutates a `Storage`,
+/// and closes with `save_data()`.
+///
+/// The recorder treats `load_data` / `save_data` as the canonical
+/// names for `EventLogKind::Read` / `EventLogKind::Write` events on
+/// the `"TolkStorage"` channel.  The shadow `storage_data` slot
+/// carries the most recently saved Cell payload so the
+/// load-mutate-save flow round-trips through the same int-only
+/// `storeInt` / `loadInt` machinery as `cell_ops_test.tolk`.  This
+/// fixture additionally exercises:
+///   * struct values flowing through a function return
+///     (`load_state` returns `Storage`),
+///   * struct values passed as arguments through a `save_state(st)`
+///     call site (enabled by the M10 arg-passing extension), and
+///   * field access on a struct passed as a parameter
+///     (`st.counter`, `st.owner` inside `save_state`).
+#[test]
+fn test_persistent_storage_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_persistent_storage_test_via_ct_print_full",
+        "persistent_storage_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "bump_counter", "load_state", "save_state"],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(29), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    // Three io_events: one save_data in compute() (the seed write),
+    // one load_data inside load_state(), and one save_data inside
+    // save_state().
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(3),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 29 steps + 4 call_entry + 4 call_exit + 3 io = 40 events.
+    assert_eq!(events.len(), 40, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "bump_counter".to_string(),
+            "load_state".to_string(),
+            "save_state".to_string(),
+        ],
+    );
+
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "load_state".to_string(),
+            "save_state".to_string(),
+            "bump_counter".to_string(),
+            "compute".to_string(),
+        ],
+    );
+
+    // Per-binding (varname, ValueRecord::kind) trail.  Cell / Slice /
+    // Builder shapes surface as Raw (the recorder doesn't model the
+    // bit-level cell wire format, but the int round-trip is what the
+    // fixture exercises).  Struct shapes carry the full `Storage`
+    // payload (`counter`, `owner`).  Bridge bindings between caller
+    // and callee scopes carry the same shape as the return value.
+    let var_kinds: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("value.kind").to_string(),
+                    )
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_kinds,
+        vec![
+            // compute(): seed the storage cell with counter=7, owner=42.
+            ("seed_b".into(), "Raw".into()),
+            ("seed_b1".into(), "Raw".into()),
+            ("seed_b2".into(), "Raw".into()),
+            ("seed_c".into(), "Raw".into()),
+            // load_state(): read seed, parse, build Storage struct.
+            ("raw".into(), "Raw".into()),
+            ("s".into(), "Raw".into()),
+            ("counter".into(), "Int".into()),
+            ("owner".into(), "Int".into()),
+            ("st".into(), "Struct".into()),
+            // bump_counter(): receive Storage, increment counter,
+            // construct updated Storage, save it.
+            ("st".into(), "Struct".into()),
+            ("current".into(), "Int".into()),
+            ("next".into(), "Int".into()),
+            ("updated".into(), "Struct".into()),
+            // save_state(updated): formal `st` bound to the actual
+            // Storage struct (only possible thanks to the M10 arg-
+            // passing extension).
+            ("st".into(), "Struct".into()),
+            ("b".into(), "Raw".into()),
+            ("b1".into(), "Raw".into()),
+            ("b2".into(), "Raw".into()),
+            ("c".into(), "Raw".into()),
+            ("saved_marker".into(), "Int".into()),
+            // Back in bump_counter: ack of save_state's int return.
+            ("ack".into(), "Int".into()),
+            // Back in compute: bumped = bump_counter's int return.
+            ("bumped".into(), "Int".into()),
+        ],
+    );
+
+    // Spot-check the round-tripped int payloads in the slice loads.
+    let counter_vals: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "counter")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(counter_vals, vec![7]);
+
+    let owner_vals: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "owner")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(owner_vals, vec![42]);
+
+    // `next` (the incremented counter) and `bumped` (the final
+    // return) must both carry the on-chain answer 8.
+    let next_vals: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "next" || v["varname"] == "bumped")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(next_vals, vec![8, 8]);
+
+    // Pin the io_event text so a regression in the storage-channel
+    // metadata surfaces immediately.  Order: seed write in compute,
+    // then load inside load_state, then save inside save_state.
+    let io_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "io")
+        .collect();
+    assert_eq!(io_events.len(), 3);
+    assert_eq!(
+        io_events[0]["text"].as_str(),
+        Some("save_data: Cell([7, 42])")
+    );
+    assert_eq!(
+        io_events[1]["text"].as_str(),
+        Some("load_data: Cell([7, 42])")
+    );
+    assert_eq!(
+        io_events[2]["text"].as_str(),
+        Some("save_data: Cell([8, 42])")
+    );
+
+    // load_state's return value must be the full Storage struct.
+    let load_state_exit = events
+        .iter()
+        .find(|e| e["kind"] == "call_exit" && e["function"] == "load_state")
+        .expect("load_state call_exit");
+    let rv = &load_state_exit["return_value"];
+    assert_eq!(rv["kind"].as_str(), Some("Struct"));
+    let fields = rv["field_values"].as_array().expect("field_values");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0]["i"].as_i64(), Some(7));
+    assert_eq!(fields[1]["i"].as_i64(), Some(42));
+
+    // The other three returns are all Ints; pin the values:
+    //   save_state -> 1 (saved_marker)
+    //   bump_counter -> 8 (next)
+    //   compute -> 8 (bumped)
+    let int_returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .filter_map(|e| {
+            let rv = &e["return_value"];
+            rv["i"].as_i64().map(|i| {
+                (
+                    e["function"].as_str().expect("function").to_string(),
+                    i,
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        int_returns,
+        vec![
+            ("save_state".into(), 1),
+            ("bump_counter".into(), 8),
+            ("compute".into(), 8),
+        ],
+    );
+}
+
+// --- contract_entrypoints_test.tolk ----------------------------------------
+
+/// Records `contract_entrypoints_test.tolk` and pins the recorder's
+/// handling of Tolk's actual on-chain entry-point hooks
+/// (`onInternalMessage` / `onExternalMessage`).  Pre-M10 the recorder
+/// hard-failed on any program without `main()`; production TON
+/// contracts never declare `main()`, so this fixture covers the
+/// canonical real-world shape end-to-end.
+///
+/// The recorder synthesises `int(0)` actuals for every formal so the
+/// body executes without needing a representative message payload.
+/// The first declared hook merges into <toplevel> at depth 0; the
+/// second runs as a normal nested call.  Helpers invoked from each
+/// hook still go through the regular call_entry / call_exit pipeline.
+#[test]
+fn test_contract_entrypoints_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_contract_entrypoints_test_via_ct_print_full",
+        "contract_entrypoints_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // Function table is populated lazily on first invocation, so the
+    // order matches the dispatch sequence:
+    //   1. onInternalMessage (first entry, merged into toplevel)
+    //   2. handle_internal (called from onInternalMessage)
+    //   3. onExternalMessage (second entry, regular call)
+    //   4. handle_external (called from onExternalMessage)
+    assert_eq!(
+        functions,
+        vec![
+            "onInternalMessage",
+            "handle_internal",
+            "onExternalMessage",
+            "handle_external",
+        ],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(10), "steps; counts={counts}");
+    // Three calls: handle_internal (from merged-into-toplevel
+    // onInternalMessage), onExternalMessage (the second entry as a
+    // regular call), and handle_external (from onExternalMessage).
+    // onInternalMessage itself doesn't appear as a call because it's
+    // merged into <toplevel>.
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 10 steps + 3 call_entry + 3 call_exit = 16 events.
+    assert_eq!(events.len(), 16, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "handle_internal".to_string(),
+            "onExternalMessage".to_string(),
+            "handle_external".to_string(),
+        ],
+    );
+
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "handle_internal".to_string(),
+            "handle_external".to_string(),
+            "onExternalMessage".to_string(),
+        ],
+    );
+
+    // Synthetic-zero arg trail: every formal binds to 0; arithmetic
+    // proceeds normally on top.  `amount=0` in handle_internal →
+    // `doubled=0`, `ack=1`.  `seq=0` in handle_external → `bumped=10`.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            // handle_internal(amount=0).
+            ("amount".into(), 0),
+            ("doubled".into(), 0),
+            ("ack".into(), 1),
+            // Bridge binding inside onInternalMessage.
+            ("processed".into(), 1),
+            // onExternalMessage(seq=0) (regular call this time).
+            ("seq".into(), 0),
+            // handle_external(seq=0).
+            ("seq".into(), 0),
+            ("bumped".into(), 10),
+            // Bridge binding inside onExternalMessage.
+            ("processed".into(), 10),
+        ],
+    );
+
+    // Return values:
+    //   handle_internal -> 1
+    //   handle_external -> 10
+    //   onExternalMessage -> 10
+    // onInternalMessage's return is absorbed into <toplevel> (no
+    // call_exit because the merge skips it).
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![1, 10, 10]);
+}
+
+// --- throw_unless_throw_if_test.tolk ---------------------------------------
+
+/// Records `throw_unless_throw_if_test.tolk` and pins the recorder's
+/// distinction between Tolk's runtime-gated guard idiom (`throwIf` /
+/// `throwUnless`) and the unconditional `throw` / static-sweep
+/// `assert` markers exercised by `error_paths_test.tolk`.
+///
+/// The fixture drives four scenarios:
+///   * `guard_amount(5)`     — `throwIf(40, 5 == 0)` does NOT trip → returns 1.
+///   * `guard_amount(0)`     — `throwIf(40, 0 == 0)` trips         → io_event(40), call_exit None.
+///   * `guard_threshold(9)`  — `throwUnless(36, 9 >= 7)` does NOT trip → returns 1.
+///   * `guard_threshold(1)`  — `throwUnless(36, 1 >= 7)` trips    → io_event(36), call_exit None.
+///
+/// EXACTLY two io_events fire (one per tripped gate); a third io_event
+/// from a non-tripping gate would be a regression of the runtime-aware
+/// path back to the static-sweep behaviour and is the key thing this
+/// test guards against.  The metadata tag (`"TolkThrow"`) reuses the
+/// existing channel so the frontend's error log can render guards
+/// alongside unconditional throws.
+#[test]
+fn test_throw_unless_throw_if_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_throw_unless_throw_if_test_via_ct_print_full",
+        "throw_unless_throw_if_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "guard_amount", "guard_threshold"],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
+    // Five calls: compute (1), guard_amount (2 — once succeeding,
+    // once tripping), guard_threshold (2 — once succeeding, once
+    // tripping).
+    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
+    // EXACTLY two io_events — the tripping `throwIf(40, 0==0)` and
+    // the tripping `throwUnless(36, 1>=7)`.  Non-tripping guards
+    // must NOT emit io_events; that is the key M10 invariant
+    // separating runtime-aware emission from the legacy static
+    // sweep.
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(2),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 18 steps + 5 call_entry + 5 call_exit + 2 io = 30 events.
+    assert_eq!(events.len(), 30, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "guard_amount".to_string(),
+            "guard_amount".to_string(),
+            "guard_threshold".to_string(),
+            "guard_threshold".to_string(),
+        ],
+    );
+
+    // Per-iteration variable trail.  `ok_a` and `ok_c` bind to 1
+    // (gate didn't trip); `ok_b` and `ok_d` are NOT bound (the
+    // tripping callee returned None so the caller's binding
+    // silently falls through, matching the recorder's
+    // "best-effort, never panic" discipline).  Similarly `total`
+    // never binds because two of its operands are missing — the
+    // arithmetic surfaces as a TVM tvm_exception, but the trace
+    // continues to finalise cleanly.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            // compute(): probe_a, then guard_amount(5) succeeds.
+            ("probe_a".into(), 5),
+            ("value".into(), 5),
+            ("ok_a".into(), 1),
+            // probe_b = 0; guard_amount(0) trips → ioError(40);
+            // ok_b is NOT bound.
+            ("probe_b".into(), 0),
+            ("value".into(), 0),
+            // probe_c = 9; guard_threshold(9) succeeds.
+            ("probe_c".into(), 9),
+            ("probe".into(), 9),
+            ("ok_c".into(), 1),
+            // probe_d = 1; guard_threshold(1) trips → ioError(36);
+            // ok_d is NOT bound; `total` cannot compute.
+            ("probe_d".into(), 1),
+            ("probe".into(), 1),
+        ],
+    );
+
+    // Pin the exact io_event text + ordering.  First the throwIf
+    // fires inside guard_amount(0); then the throwUnless fires
+    // inside guard_threshold(1).
+    let io_events: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .collect();
+    assert_eq!(io_events.len(), 2, "exactly two ioError events");
+    assert_eq!(
+        io_events[0]["text"].as_str(),
+        Some("throwIf: code 40"),
+        "first ioError text"
+    );
+    assert_eq!(
+        io_events[1]["text"].as_str(),
+        Some("throwUnless: code 36"),
+        "second ioError text"
+    );
+
+    // Returns: succeeding guards return Int(1); tripping guards
+    // produce a Void exit (the recorder surfaces unbound returns as
+    // NONE_VALUE which ct-print decodes as kind: "Void").
+    let returns: Vec<(String, Option<i64>)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let fname = e["function"].as_str().expect("function").to_string();
+            let rv = &e["return_value"];
+            let i = rv["i"].as_i64();
+            (fname, i)
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![
+            ("guard_amount".into(), Some(1)),
+            ("guard_amount".into(), None),
+            ("guard_threshold".into(), Some(1)),
+            ("guard_threshold".into(), None),
+            ("compute".into(), None),
+        ],
+    );
+}
+
+// --- builder_refs_test.tolk ------------------------------------------------
+
+/// Records `builder_refs_test.tolk` and pins the recorder's
+/// extended Builder/Slice ref-bearing op coverage.  Where
+/// `cell_ops_test.tolk` exercised only int-flat payloads, this
+/// fixture drives `storeRef` / `loadRef` (sub-cell append + pop),
+/// `storeAddress` / `loadAddress` (address-shaped scalars), and the
+/// recorder's parallel ref-queue cursor on the Slice ValueRecord.
+///
+/// Spec-compliant recording surfaces:
+///   * each Builder/Cell/Slice's ref queue alongside its int payload
+///     (`Cell([200, 51966]) refs=[Cell([101])]`) so the trace shape
+///     diverges visibly from the no-ref `cell_ops_test.tolk` outputs,
+///   * `loadRef()` returning the sub-cell with the exact int payload
+///     stored at the source site (`Cell([101])`),
+///   * `loadAddress()` returning the stored address scalar as a real
+///     Int ValueRecord (51966 = 0xCAFE; the fixture uses decimal so
+///     it parses through the int-only TVM expression compiler).
+#[test]
+fn test_builder_refs_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_builder_refs_test_via_ct_print_full",
+        "builder_refs_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "pack_outer", "pack_inner", "unpack"],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(24), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 24 steps + 4 call_entry + 4 call_exit = 32 events.
+    assert_eq!(events.len(), 32, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "pack_outer".to_string(),
+            "pack_inner".to_string(),
+            "unpack".to_string(),
+        ],
+    );
+
+    // Per-binding (varname, ValueRecord::kind) trail.  Cell / Slice /
+    // Builder shapes surface as Raw.  This is the strict equivalent
+    // of cell_ops_test's `var_kinds` assertion but extended with the
+    // ref-queue annotations.
+    let var_kinds: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("value.kind").to_string(),
+                    )
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_kinds,
+        vec![
+            // pack_inner(): ib, ib1, inner.
+            ("ib".into(), "Raw".into()),
+            ("ib1".into(), "Raw".into()),
+            ("inner".into(), "Raw".into()),
+            // pack_outer(): receives inner from pack_inner(), builds outer.
+            ("inner".into(), "Raw".into()),
+            ("ob".into(), "Raw".into()),
+            ("ob1".into(), "Raw".into()),
+            ("ob2".into(), "Raw".into()),
+            ("ob3".into(), "Raw".into()),
+            ("outer".into(), "Raw".into()),
+            // compute(): packed = pack_outer() result.
+            ("packed".into(), "Raw".into()),
+            // unpack(c): c (param), s, marker, sub, addr, sub_s, inner_val, combined.
+            ("c".into(), "Raw".into()),
+            ("s".into(), "Raw".into()),
+            ("marker".into(), "Int".into()),
+            ("sub".into(), "Raw".into()),
+            ("addr".into(), "Int".into()),
+            ("sub_s".into(), "Raw".into()),
+            ("inner_val".into(), "Int".into()),
+            ("combined".into(), "Int".into()),
+            // compute(): decoded = unpack(packed) result.
+            ("decoded".into(), "Int".into()),
+        ],
+    );
+
+    // Pin the exact Raw `r` strings for the ref-bearing values so a
+    // regression in the ref-queue serialisation surfaces immediately.
+    // These are the key M10 invariants that distinguish this fixture
+    // from cell_ops_test (which produced bare `Cell([...])` strings).
+    let raw_by_name = |name: &str, expected_r: &str| {
+        let entry = events
+            .iter()
+            .filter(|e| e["kind"] == "step")
+            .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+            .find(|v| v["varname"] == name && v["value"]["kind"] == "Raw")
+            .unwrap_or_else(|| panic!("expected `{name}` to surface as Raw"));
+        assert_eq!(
+            entry["value"]["r"].as_str(),
+            Some(expected_r),
+            "Raw.r for `{name}`"
+        );
+    };
+    raw_by_name("inner", "Cell([101])");
+    raw_by_name("ob2", "Builder([200]) refs=[Cell([101])]");
+    raw_by_name("ob3", "Builder([200, 51966]) refs=[Cell([101])]");
+    raw_by_name("outer", "Cell([200, 51966]) refs=[Cell([101])]");
+    raw_by_name("packed", "Cell([200, 51966]) refs=[Cell([101])]");
+    raw_by_name("c", "Cell([200, 51966]) refs=[Cell([101])]");
+    raw_by_name("sub", "Cell([101])");
+
+    // Spot-check the int payloads recovered from `loadInt` /
+    // `loadAddress`.  Cursor walk inside `unpack`:
+    //   loadInt(32) -> marker = 200
+    //   loadRef()    -> sub = Cell([101])  (cursor unchanged)
+    //   loadAddress() -> addr = 51966
+    let marker_vals: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "marker")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(marker_vals, vec![200]);
+
+    let addr_vals: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "addr")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(addr_vals, vec![51966]);
+
+    let inner_vals: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "inner_val")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(inner_vals, vec![101]);
+
+    // Returns:
+    //   pack_inner -> Cell([101])      (Raw)
+    //   pack_outer -> Cell([200,51966]) refs=[Cell([101])]  (Raw)
+    //   unpack     -> 52267  (200 + 101 + 51966)
+    //   compute    -> 52267
+    let returns: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .collect();
+    assert_eq!(returns.len(), 4);
+    assert_eq!(returns[0]["return_value"]["kind"].as_str(), Some("Raw"));
+    assert_eq!(
+        returns[0]["return_value"]["r"].as_str(),
+        Some("Cell([101])")
+    );
+    assert_eq!(returns[1]["return_value"]["kind"].as_str(), Some("Raw"));
+    assert_eq!(
+        returns[1]["return_value"]["r"].as_str(),
+        Some("Cell([200, 51966]) refs=[Cell([101])]")
+    );
+    assert_eq!(returns[2]["return_value"]["kind"].as_str(), Some("Int"));
+    assert_eq!(returns[2]["return_value"]["i"].as_i64(), Some(52267));
+    assert_eq!(returns[3]["return_value"]["kind"].as_str(), Some("Int"));
+    assert_eq!(returns[3]["return_value"]["i"].as_i64(), Some(52267));
+}
+
 // ===========================================================================
 // CLI smoke + env-var tests
 // ===========================================================================
