@@ -757,15 +757,14 @@ fn test_error_paths_test_emits_throw_event() {
 
 // --- tuples_structs_test.tolk ----------------------------------------------
 
-/// Records `tuples_structs_test.tolk` and pins the **current
-/// observed** shape.  RECORDER BUG: tuple literals, struct literals,
-/// and field accesses (`p.x`, `pair.0`) are all opaque to the
-/// recorder's expression parser, so any binding whose right-hand
-/// side mentions one of them silently drops out (eval returns
-/// Ok(None) and no Value event is emitted).  Only the integer
-/// let-bindings inside the zero-arg `scalar_only` helper survive.
-/// See the parallel `#[ignore]`d test for the spec-compliant
-/// expectation (Tuple / Struct ValueRecord variants).
+/// Strict full-trace assertion that the recorder decodes Tolk's
+/// structured literals end-to-end.  Tuple literals (`(10, 20)`) lift
+/// to `ValueRecord::Tuple`; struct literals (`Point { x: 3, y: 4 }`)
+/// lift to `ValueRecord::Struct`; field accesses (`pair.0`, `p.x`)
+/// resolve through the structured env to scalar Ints, and every
+/// helper's return value computes the on-chain answer
+/// (`sum_pair=30`, `point_distance_sq=25`, `scalar_only=5`,
+/// `compute=60`).
 #[test]
 fn test_tuples_structs_test_via_ct_print_full() {
     let Some((doc, source_path)) = record_and_dump_full(
@@ -802,6 +801,11 @@ fn test_tuples_structs_test_via_ct_print_full() {
         Some(0),
         "io_events; counts={counts}"
     );
+    assert_eq!(
+        counts["values"].as_u64(),
+        Some(19),
+        "values; counts={counts}"
+    );
 
     let events = doc["events"].as_array().expect("events array");
     // 19 steps + 4 call_entry + 4 call_exit = 27 events.
@@ -818,54 +822,145 @@ fn test_tuples_structs_test_via_ct_print_full() {
         ],
     );
 
-    // RECORDER BUG: spec-compliant output would surface `pair` as
-    // ValueRecord::Tuple, `p` as ValueRecord::Struct, and decode
-    // `pair.0`, `pair.1`, `p.x`, `p.y` to scalar Int values.  Today
-    // only the scalar_only helper's three Ints + the bound
-    // `scalar_total` in compute() come through.
+    // ----- Structured variable shapes ---------------------------------
+    // Walk the step events in emission order and pin the (name,
+    // ValueRecord::kind) pair for every variable.  This is stricter
+    // than `observed_int_vars` (which only accepts Int) because the
+    // tuples/structs fixture deliberately exercises Tuple / Struct
+    // shapes that must NOT silently downgrade to Int.
+    let var_sequence: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("value.kind").to_string(),
+                    )
+                })
+        })
+        .collect();
     assert_eq!(
-        observed_int_vars(&doc),
+        var_sequence,
         vec![
-            ("head_val".into(), 1),
-            ("len".into(), 4),
-            ("total".into(), 5),
-            ("scalar_total".into(), 5),
+            // sum_pair: tuple literal `pair = (10, 20)`, then
+            // field-access projections `first = pair.0` / `second
+            // = pair.1`, then arithmetic `pair_sum = first + second`.
+            ("pair".into(), "Tuple".into()),
+            ("first".into(), "Int".into()),
+            ("second".into(), "Int".into()),
+            ("pair_sum".into(), "Int".into()),
+            // back in compute: sum_pair returned 30.
+            ("pair_total".into(), "Int".into()),
+            // point_distance_sq: struct literal `p = Point { x: 3, y: 4 }`,
+            // then field-access arithmetic `sq = p.x * p.x + p.y * p.y`.
+            ("p".into(), "Struct".into()),
+            ("sq".into(), "Int".into()),
+            // back in compute: point_distance_sq returned 25.
+            ("point_total".into(), "Int".into()),
+            // scalar_only: pure-arithmetic helper.
+            ("head_val".into(), "Int".into()),
+            ("len".into(), "Int".into()),
+            ("total".into(), "Int".into()),
+            // back in compute: scalar_only returned 5; final binding.
+            ("scalar_total".into(), "Int".into()),
+            ("grand_total".into(), "Int".into()),
         ],
     );
 
-    // RECORDER BUG: returns from sum_pair / point_distance_sq /
-    // compute are NONE_VALUE today because their final expressions
-    // (`pair_sum`, `sq`, `grand_total`) reference unbound variables
-    // (their right-hand sides didn't parse).  Spec-compliant returns
-    // would be: sum_pair=30, point_distance_sq=25, scalar_only=5,
-    // compute=60.  We assert the present-day variant tags
-    // (`Void` for the three broken returns -- ct-print decodes
-    // ValueRecord::None as `{"kind":"Void"}` -- and `Int(5)` for
-    // scalar_only) so a future fix surfaces immediately.
+    // ----- Spot-check the structured payloads --------------------------
+    let pair_tuple = find_var_value(&doc, "pair", "Tuple");
+    let elems = pair_tuple["elements"]
+        .as_array()
+        .expect("Tuple elements array");
+    let int_at = |i: usize| {
+        assert_eq!(elems[i]["kind"].as_str(), Some("Int"));
+        elems[i]["i"].as_i64().expect("Int.i")
+    };
+    assert_eq!(int_at(0), 10);
+    assert_eq!(int_at(1), 20);
+
+    let p_struct = find_var_value(&doc, "p", "Struct");
+    let fields = p_struct["field_values"]
+        .as_array()
+        .expect("Struct field_values array");
+    let f_int_at = |i: usize| {
+        assert_eq!(fields[i]["kind"].as_str(), Some("Int"));
+        fields[i]["i"].as_i64().expect("Int.i")
+    };
+    assert_eq!(f_int_at(0), 3);
+    assert_eq!(f_int_at(1), 4);
+
+    // ----- Return values: every helper now returns a real Int ---------
     let return_kinds: Vec<&str> = events
         .iter()
         .filter(|e| e["kind"] == "call_exit")
         .map(|e| e["return_value"]["kind"].as_str().expect("return.kind"))
         .collect();
-    assert_eq!(return_kinds, vec!["Void", "Void", "Int", "Void"]);
-    let scalar_return = events
+    assert_eq!(return_kinds, vec!["Int", "Int", "Int", "Int"]);
+    let return_values: Vec<(String, i64)> = events
         .iter()
-        .filter(|e| e["kind"] == "call_exit" && e["function"] == "scalar_only")
-        .map(|e| e["return_value"]["i"].as_i64().expect("Int.i"))
-        .next()
-        .expect("scalar_only return");
-    assert_eq!(scalar_return, 5);
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            (
+                e["function"].as_str().expect("call_exit.function").to_string(),
+                e["return_value"]["i"].as_i64().expect("Int.i"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        return_values,
+        vec![
+            ("sum_pair".into(), 30),
+            ("point_distance_sq".into(), 25),
+            ("scalar_only".into(), 5),
+            ("compute".into(), 60),
+        ],
+    );
 }
 
+/// Locate the first `vars[].value` entry in the trace whose `varname`
+/// matches `name` and whose `value.kind` matches `expected_kind`.
+/// Panics with a precise message if no such entry exists — that's by
+/// design: callers use this to pin a specific shape, and a missing
+/// entry is a real recorder regression.
+fn find_var_value(
+    doc: &serde_json::Value,
+    name: &str,
+    expected_kind: &str,
+) -> serde_json::Value {
+    for ev in doc["events"].as_array().expect("events array") {
+        if ev["kind"] != "step" {
+            continue;
+        }
+        for v in ev["vars"].as_array().cloned().unwrap_or_default() {
+            if v["varname"].as_str() == Some(name)
+                && v["value"]["kind"].as_str() == Some(expected_kind)
+            {
+                return v["value"].clone();
+            }
+        }
+    }
+    panic!(
+        "expected a `{name}` variable with value.kind == {expected_kind:?} \
+         in the trace; got none"
+    );
+}
+
+/// Spec-compliant assertion that the recorder decodes Tolk's
+/// structured literals.  The recorder lifts tuple literals
+/// (`(10, 20)`) into `ValueRecord::Tuple`, struct literals
+/// (`Point { x: 3, y: 4 }`) into `ValueRecord::Struct`, and decodes
+/// field accesses (`pair.0`, `p.x`) to scalar Ints — the four
+/// helper returns now compute on-chain values
+/// (`sum_pair=30`, `point_distance_sq=25`, `scalar_only=5`,
+/// `compute=60`).
 #[test]
-#[ignore = "RECORDER BUG: tuple literals (`(10, 20)`), struct literals \
-            (`Point { x: 3, y: 4 }`), and field accesses (`p.x`, \
-            `pair.0`) are opaque to the source-level expression parser. \
-            Spec-compliant output should surface `pair` as \
-            ValueRecord::Tuple, `p` as ValueRecord::Struct, decode \
-            `pair.0`/`pair.1`/`p.x`/`p.y` to Int, and yield returns \
-            sum_pair=30, point_distance_sq=25, scalar_only=5, \
-            compute=60."]
 fn test_tuples_structs_test_value_kinds_present() {
     let Some((doc, _)) = record_and_dump_full(
         "test_tuples_structs_test_value_kinds_present",
