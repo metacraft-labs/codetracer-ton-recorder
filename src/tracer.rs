@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord, NONE_VALUE};
+use codetracer_trace_types::{EventLogKind, Line, TypeId, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 use eyre::{eyre, Context, Result};
@@ -91,6 +91,49 @@ enum Statement {
     },
 }
 
+/// A run-time Tolk value flowing through the hand-rolled evaluator.
+///
+/// The recorder grew out of an int-only proof-of-concept where the
+/// evaluation env was `HashMap<String, i64>`.  That was enough for
+/// the pure-arithmetic fixtures (`flow_test.tolk`, `nested_calls_test.tolk`,
+/// `control_flow_test.tolk`), but `tuples_structs_test.tolk` exercises
+/// two structured shapes — tuple literal `(10, 20)` and struct literal
+/// `Point { x: 3, y: 4 }` — that the trace MUST surface as
+/// `ValueRecord::Tuple` / `ValueRecord::Struct` per
+/// `metacraft-specs/policies/recorder-test-requirements.md`.
+///
+/// `Value` is the smallest superset that lets the same env carry both
+/// scalars (for the existing TVM arithmetic pipeline) and the new
+/// structured shapes.  Conversion to `ValueRecord` happens at the
+/// `register_variable_with_full_value` boundary; conversion back to
+/// `i64` (for `tvm_eval_expr_checked`) happens via `Value::as_i64`
+/// (used to project the env down to the int sub-env).
+#[derive(Debug, Clone)]
+enum Value {
+    Int(i64),
+    /// Tolk tuple literal — emitted as `ValueRecord::Tuple`.
+    Tuple(Vec<Value>),
+    /// Tolk struct literal — emitted as `ValueRecord::Struct`.  The
+    /// type name is needed so we can `ensure_type_id` the right
+    /// `TypeKind::Struct`; field names are kept for `p.field` access.
+    Struct {
+        type_name: String,
+        fields: Vec<(String, Value)>,
+    },
+}
+
+impl Value {
+    /// Project to `i64` for the TVM arithmetic pipeline.  Only the
+    /// `Int` variant has a meaningful answer; structured values can't
+    /// be substituted into a TVM PUSHINT/ADD/MUL/... program.
+    fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The main tracer
 // ---------------------------------------------------------------------------
@@ -149,6 +192,13 @@ impl TolkTracer {
                 TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Int, type_name);
             tracer.type_ids.insert(type_name.to_string(), type_id);
         }
+        // Pre-register the generic structured-value type names used by
+        // the literal-emitting paths.  Per-struct-type names (e.g.
+        // "Point") are registered lazily in `value_to_record` the
+        // first time a literal of that shape lands in the trace.
+        let tuple_type_id =
+            TraceWriter::ensure_type_id(&mut *tracer.writer, TypeKind::Seq, "Tuple");
+        tracer.type_ids.insert("Tuple".to_string(), tuple_type_id);
 
         // -- 5. Evaluate and emit trace events --
         tracer.evaluate_program(source_path, &functions)?;
@@ -246,7 +296,7 @@ impl TolkTracer {
             .get("main")
             .ok_or_else(|| eyre!("no main function found in Tolk program"))?;
 
-        let mut env = HashMap::new();
+        let mut env: HashMap<String, Value> = HashMap::new();
         // Merge main() into <toplevel> by skipping its Call/Return events.
         // TraceWriter::start() already created <toplevel> at depth 0. Emitting
         // register_call(main) would push all main-body steps to depth 1 and any
@@ -255,6 +305,54 @@ impl TolkTracer {
         self.evaluate_function(source_path, main_fn, &func_map, &mut env, true)?;
 
         Ok(())
+    }
+
+    /// Convert a structured `Value` to its on-trace `ValueRecord`
+    /// shape and register the necessary type ids on first use.
+    ///
+    /// `Int` → `ValueRecord::Int { type_id: type_ids["int"] }`.
+    /// `Tuple` → `ValueRecord::Tuple { type_id: type_ids["Tuple"] }`.
+    /// `Struct { type_name }` → `ValueRecord::Struct { type_id: type_ids[type_name] }`,
+    ///   lazily registering `type_name` as `TypeKind::Struct` the first
+    ///   time it's seen.  Field names are dropped at the
+    ///   `ValueRecord::Struct` boundary (the wire format only carries
+    ///   `field_values: Vec<ValueRecord>`); the per-type
+    ///   `TypeSpecificInfo::Struct { fields }` registration that
+    ///   carries the names is handled inside the Nim writer.
+    fn value_to_record(&mut self, val: &Value) -> ValueRecord {
+        match val {
+            Value::Int(i) => {
+                let type_id = self.type_ids.get("int").copied().unwrap_or(TypeId(0));
+                ValueRecord::Int { i: *i, type_id }
+            }
+            Value::Tuple(elements) => {
+                let elements: Vec<ValueRecord> =
+                    elements.iter().map(|v| self.value_to_record(v)).collect();
+                let type_id = self.type_ids.get("Tuple").copied().unwrap_or(TypeId(0));
+                ValueRecord::Tuple { elements, type_id }
+            }
+            Value::Struct { type_name, fields } => {
+                let field_values: Vec<ValueRecord> = fields
+                    .iter()
+                    .map(|(_n, v)| self.value_to_record(v))
+                    .collect();
+                let type_id = if let Some(id) = self.type_ids.get(type_name).copied() {
+                    id
+                } else {
+                    let id = TraceWriter::ensure_type_id(
+                        &mut *self.writer,
+                        TypeKind::Struct,
+                        type_name,
+                    );
+                    self.type_ids.insert(type_name.clone(), id);
+                    id
+                };
+                ValueRecord::Struct {
+                    field_values,
+                    type_id,
+                }
+            }
+        }
     }
 
     /// Evaluate a single function, emitting trace events.
@@ -268,9 +366,9 @@ impl TolkTracer {
         source_path: &Path,
         func: &FunctionDef,
         func_map: &HashMap<String, &FunctionDef>,
-        _parent_env: &mut HashMap<String, i64>,
+        _parent_env: &mut HashMap<String, Value>,
         is_entry_point: bool,
-    ) -> Result<Option<i64>> {
+    ) -> Result<Option<Value>> {
         // Register function metadata (for function list / calltrace).
         let fn_id = TraceWriter::ensure_function_id(
             &mut *self.writer,
@@ -305,8 +403,8 @@ impl TolkTracer {
         }
 
         // Local variable environment for this function.
-        let mut env: HashMap<String, i64> = HashMap::new();
-        let mut return_value: Option<i64> = None;
+        let mut env: HashMap<String, Value> = HashMap::new();
+        let mut return_value: Option<Value> = None;
         // Symbolic stack tracker: mirrors TVM execution to reconstruct
         // source-level variable names from stack positions.
         let mut sym_stack = StackTracker::new();
@@ -322,30 +420,53 @@ impl TolkTracer {
                     // Emit Step event.
                     TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
-                    // Evaluate the expression via the real TVM.
-                    if let Some(val) = self.eval_expr(expr, &env, source_path, func_map)? {
-                        // Track the expression symbolically. track_expr
-                        // decomposes the expression and produces a derived
-                        // name (e.g. "a + b") which we can inspect but the
-                        // authoritative name is the LHS variable name.
-                        let expr_tracker = stack_tracker::track_expr(expr, &env, val);
-                        let _derived = expr_tracker.variables_at_step();
+                    // Try the structured-value path first — this captures
+                    // tuple / struct literals and field accesses (`p.x`,
+                    // `pair.0`).  Falls back to the historical i64-only
+                    // TVM path inside `eval_expr_to_value` for pure
+                    // arithmetic.  Per `policies/recorder-test-requirements.md`
+                    // §1, every value flowing through a step event MUST
+                    // surface as the matching `ValueRecord` variant; so
+                    // we detect Tuple/Struct shapes BEFORE projecting to
+                    // i64 (which would silently downgrade them to
+                    // "missing identifier" the moment they hit
+                    // `tvm_eval_expr_checked`).
+                    if let Some(val) =
+                        self.eval_expr_to_value(expr, &env, source_path, func_map)?
+                    {
+                        // For pure-Int values, keep the legacy
+                        // stack-tracker bookkeeping (so derived
+                        // variable-name decoration continues to work
+                        // for arithmetic-only fixtures).
+                        if let Some(int_val) = val.as_i64() {
+                            let int_env = value_env_to_i64_map(&env);
+                            let expr_tracker =
+                                stack_tracker::track_expr(expr, &int_env, int_val);
+                            let _derived = expr_tracker.variables_at_step();
+                            sym_stack.push(int_val, Some(name.clone()));
+                        }
 
+                        // Emit Value event using the source-level
+                        // variable name and the structured value
+                        // record (Int / Tuple / Struct).  For
+                        // declared-type Ints we honour the
+                        // `type_name`-keyed lookup so `bool` etc. keep
+                        // their narrower TypeId; for structured values
+                        // `value_to_record` picks the right id.
+                        let value = match &val {
+                            Value::Int(i) => {
+                                let type_id = self
+                                    .type_ids
+                                    .get(type_name)
+                                    .copied()
+                                    .unwrap_or_else(|| {
+                                        self.type_ids.get("int").copied().unwrap()
+                                    });
+                                ValueRecord::Int { i: *i, type_id }
+                            }
+                            _ => self.value_to_record(&val),
+                        };
                         env.insert(name.clone(), val);
-
-                        // Push the bound variable onto the symbolic stack so
-                        // subsequent expressions can reference it.
-                        sym_stack.push(val, Some(name.clone()));
-
-                        // Emit Value event -- use the source-level variable
-                        // name (which the stack tracker now carries).
-                        let type_id = self
-                            .type_ids
-                            .get(type_name)
-                            .copied()
-                            .unwrap_or_else(|| self.type_ids.get("int").copied().unwrap());
-
-                        let value = ValueRecord::Int { i: val, type_id };
                         TraceWriter::register_variable_with_full_value(
                             &mut *self.writer,
                             name,
@@ -357,8 +478,13 @@ impl TolkTracer {
                     // Emit Step event for the return line.
                     TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
-                    // Evaluate the return expression via the real TVM.
-                    if let Some(val) = self.eval_expr(expr, &env, source_path, func_map)? {
+                    // Evaluate the return expression via the structured
+                    // resolver (handles literals, field access, calls
+                    // returning structured values, and falls back to
+                    // the int-only TVM pipeline for pure arithmetic).
+                    if let Some(val) =
+                        self.eval_expr_to_value(expr, &env, source_path, func_map)?
+                    {
                         return_value = Some(val);
                     }
                 }
@@ -387,10 +513,9 @@ impl TolkTracer {
         // Emit Return event (skip for entry point — its steps live under
         // <toplevel> which is closed separately).
         if !is_entry_point {
-            match return_value {
+            match &return_value {
                 Some(val) => {
-                    let type_id = self.type_ids.get("int").copied().unwrap();
-                    let value = ValueRecord::Int { i: val, type_id };
+                    let value = self.value_to_record(val);
                     TraceWriter::register_return(&mut *self.writer, value);
                 }
                 None => {
@@ -405,10 +530,18 @@ impl TolkTracer {
     /// Evaluate an expression in the current environment.
     /// Handles function calls, literals, variable references, and binary ops.
     /// All arithmetic is performed by the real TVM via `tycho-vm`.
+    ///
+    /// This is the int-only fallback path; structured shapes (tuple /
+    /// struct literals, field accesses) are intercepted in
+    /// `eval_expr_to_value` BEFORE reaching here.  Field accesses that
+    /// resolve to scalar Ints are pre-substituted by
+    /// `resolve_field_accesses` so the TVM compiler (which only knows
+    /// about identifiers and integer literals) sees an int-only
+    /// expression.
     fn eval_expr(
         &mut self,
         expr: &str,
-        env: &HashMap<String, i64>,
+        env: &HashMap<String, Value>,
         source_path: &Path,
         func_map: &HashMap<String, &FunctionDef>,
     ) -> Result<Option<i64>> {
@@ -418,26 +551,46 @@ impl TolkTracer {
             return Ok(None);
         }
 
+        // Field-access pre-pass: rewrite every `<ident>.<field>`
+        // (where `<ident>` is bound in `env` to a `Value::Struct` or
+        // `Value::Tuple`) to the resolved scalar literal, so the
+        // downstream TVM compiler sees an int-only expression.
+        // Without this, `p.x * p.x + p.y * p.y` would be unresolvable
+        // — `parse_expr` doesn't understand dotted names — and
+        // `point_distance_sq` would silently return `None`.
+        let resolved = resolve_field_accesses(expr, env);
+        let expr_str: &str = &resolved;
+
         // Check for function call: <name>()
-        if let Some(call_name) = parse_function_call(expr) {
+        if let Some(call_name) = parse_function_call(expr_str) {
             if let Some(callee) = func_map.get(&call_name) {
                 let callee = (*callee).clone();
-                let mut dummy_env = HashMap::new();
+                let mut dummy_env: HashMap<String, Value> = HashMap::new();
                 let result =
                     self.evaluate_function(source_path, &callee, func_map, &mut dummy_env, false)?;
-                return Ok(result);
+                // Only Int return values feed back into the TVM
+                // arithmetic pipeline; structured returns surface via
+                // `eval_expr_to_value` directly.
+                return Ok(result.and_then(|v| v.as_i64()));
             }
         }
+
+        // Build the int-only sub-env that `tvm_eval_expr_checked`
+        // expects, projecting structured `Value`s through `as_i64`
+        // (which returns `None` for non-`Int` shapes — they're
+        // simply absent from the TVM substitution map, matching the
+        // behaviour of any other unknown identifier).
+        let int_env = value_env_to_i64_map(env);
 
         // Evaluate via real TVM execution.  Use the checked variant
         // so we can route TVM execution failures (overflow, gas
         // exhaustion, divide-by-zero, etc.) through the structured
         // event channel instead of dropping them silently.
-        match crate::tvm::tvm_eval_expr_checked(expr, env) {
+        match crate::tvm::tvm_eval_expr_checked(expr_str, &int_env) {
             Ok(value) => Ok(value),
             Err(err) => {
                 let message = format!("{err}");
-                eprintln!("TVM execution error in '{expr}': {message}");
+                eprintln!("TVM execution error in '{expr_str}': {message}");
                 TraceWriter::register_special_event(
                     &mut *self.writer,
                     EventLogKind::Error,
@@ -451,6 +604,204 @@ impl TolkTracer {
             }
         }
     }
+
+    /// Evaluate a Tolk expression to a `Value`, supporting both
+    /// structured shapes (tuple / struct literals, field accesses,
+    /// calls returning structured values) and the existing int-only
+    /// TVM arithmetic pipeline.
+    ///
+    /// Resolution order (first match wins):
+    /// 1. Struct literal `Type { f: v, g: w }` → `Value::Struct { ... }`.
+    /// 2. Tuple literal `(a, b[, c...])` (paren-wrapped, 2+ comma-
+    ///    separated elements) → `Value::Tuple(...)`.
+    /// 3. Bare variable reference — read from `env` (preserves
+    ///    structured shape, no TVM round-trip).
+    /// 4. Field access `<lhs>.<field>` — `Value::Struct` (named
+    ///    field) or `Value::Tuple` (numeric index) projection.
+    /// 5. Function call `f()` — recurse into `evaluate_function`,
+    ///    return the callee's `Value` result.
+    /// 6. Fallback — delegate to `eval_expr` (the int-only TVM
+    ///    arithmetic pipeline) and lift the `i64` result back into
+    ///    a `Value::Int`.
+    fn eval_expr_to_value(
+        &mut self,
+        expr: &str,
+        env: &HashMap<String, Value>,
+        source_path: &Path,
+        func_map: &HashMap<String, &FunctionDef>,
+    ) -> Result<Option<Value>> {
+        let expr = expr.trim();
+        if expr.is_empty() {
+            return Ok(None);
+        }
+
+        // 1. Struct literal: `Type { f: v, g: w }`.
+        if let Some((type_name, fields)) = parse_struct_literal(expr) {
+            let mut out_fields = Vec::with_capacity(fields.len());
+            for (fname, fexpr) in fields {
+                match self.eval_expr_to_value(&fexpr, env, source_path, func_map)? {
+                    Some(v) => out_fields.push((fname, v)),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(Value::Struct {
+                type_name,
+                fields: out_fields,
+            }));
+        }
+
+        // 2. Tuple literal: `(a, b[, c...])` — must be paren-wrapped
+        // and contain at least one top-level comma at depth 1.
+        if let Some(elems) = parse_tuple_literal(expr) {
+            let mut out = Vec::with_capacity(elems.len());
+            for e in elems {
+                match self.eval_expr_to_value(&e, env, source_path, func_map)? {
+                    Some(v) => out.push(v),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(Value::Tuple(out)));
+        }
+
+        // 3. Bare variable reference — preserves structured shape.
+        if is_simple_identifier(expr) {
+            if let Some(v) = env.get(expr) {
+                return Ok(Some(v.clone()));
+            }
+            // Fall through to TVM for unknown identifiers (will
+            // surface as an evaluation error rather than panicking).
+        }
+
+        // 4. Field access: `<lhs>.<field>` — top-level dot, where
+        // `<lhs>` resolves to a `Value::Struct` or `Value::Tuple`
+        // and `<field>` is either a field name (Struct) or numeric
+        // index (Tuple).
+        if let Some((lhs, field)) = split_top_level_dot(expr) {
+            if let Some(base) = self.eval_expr_to_value(lhs, env, source_path, func_map)? {
+                match (&base, field) {
+                    (Value::Struct { fields, .. }, fname) => {
+                        if let Some((_, v)) = fields.iter().find(|(n, _)| n == fname) {
+                            return Ok(Some(v.clone()));
+                        }
+                    }
+                    (Value::Tuple(elements), idx_str) => {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if let Some(v) = elements.get(idx) {
+                                return Ok(Some(v.clone()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 5. Function call returning a structured value.  We only
+        // intercept calls whose result is non-Int — Int-returning
+        // calls fall through to the existing `eval_expr` path so the
+        // TVM pipeline continues to drive arithmetic.
+        if let Some(call_name) = parse_function_call(expr) {
+            if let Some(callee) = func_map.get(&call_name) {
+                let callee = (*callee).clone();
+                let mut dummy_env: HashMap<String, Value> = HashMap::new();
+                let result = self.evaluate_function(
+                    source_path,
+                    &callee,
+                    func_map,
+                    &mut dummy_env,
+                    false,
+                )?;
+                if let Some(v) = result {
+                    return Ok(Some(v));
+                }
+            }
+        }
+
+        // 6. Fallback — int-only TVM arithmetic.  Lift the resulting
+        // `i64` (if any) back into a `Value::Int`.
+        let result = self.eval_expr(expr, env, source_path, func_map)?;
+        Ok(result.map(Value::Int))
+    }
+}
+
+/// Project a structured `Value` env down to the int-only sub-env that
+/// `tvm_eval_expr_checked` consumes for variable substitution.  Non-`Int`
+/// values are dropped (they simply won't be found by the TVM compiler,
+/// matching the historical "unknown identifier → leave the substitution
+/// hole" behaviour).
+fn value_env_to_i64_map(env: &HashMap<String, Value>) -> HashMap<String, i64> {
+    env.iter()
+        .filter_map(|(k, v)| v.as_i64().map(|i| (k.clone(), i)))
+        .collect()
+}
+
+/// Rewrite every `<ident>.<field-or-index>` subterm of `expr` (where
+/// `<ident>` is bound in `env` to a `Value::Struct` or `Value::Tuple`)
+/// to the resolved scalar literal text.  Used by `eval_expr` to bridge
+/// the field-access syntax to the int-only TVM substitution map that
+/// `tvm_eval_expr_checked` expects.
+///
+/// Walks the expression byte-by-byte, identifying maximal runs of
+/// `<ident>.<field>` shape at safe positions (i.e. the head of the
+/// `<ident>` must be at a word boundary).  Only `Int`-valued field
+/// projections are substituted; structured-valued projections stay
+/// in place (they'd just hit the same "unknown identifier" wall
+/// downstream).
+fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
+        let at_word_boundary = match prev {
+            None => true,
+            Some(p) => !(p.is_ascii_alphanumeric() || p == b'_' || p == b'.'),
+        };
+        if at_word_boundary && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            let ident_start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let ident = &expr[ident_start..i];
+            if i < bytes.len() && bytes[i] == b'.' {
+                // `<ident>.<field>` — gather the field run (alnum / _).
+                let field_start = i + 1;
+                let mut j = field_start;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                if j > field_start {
+                    let field = &expr[field_start..j];
+                    if let Some(base) = env.get(ident) {
+                        let resolved: Option<i64> = match base {
+                            Value::Struct { fields, .. } => fields
+                                .iter()
+                                .find(|(n, _)| n == field)
+                                .and_then(|(_, v)| v.as_i64()),
+                            Value::Tuple(elements) => field
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|idx| elements.get(idx))
+                                .and_then(|v| v.as_i64()),
+                            _ => None,
+                        };
+                        if let Some(n) = resolved {
+                            out.push_str(&n.to_string());
+                            i = j;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push_str(ident);
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +1051,166 @@ fn parse_function_call(expr: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Split a string on top-level commas (commas at depth 0 across all
+/// bracket flavours).  Each element is trimmed; an all-whitespace input
+/// yields an empty `Vec`.
+///
+/// Tracks `()`, `[]`, and `{}` together so structured literals nested
+/// inside an outer expression are passed through atomically.
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return vec![];
+    }
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim().to_string());
+    out
+}
+
+/// Recognise an identifier (alphanumeric + underscore, starting with a
+/// letter or underscore).  Used by `eval_expr_to_value` to short-circuit
+/// the TVM round-trip when the expression is a bare variable reference
+/// whose env value is already a `Value` (so structured shapes survive
+/// the lookup instead of being projected to `i64` and re-lifted to
+/// `Value::Int`).
+fn is_simple_identifier(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Find a top-level `.` separator between a left-hand expression and a
+/// single trailing field name / numeric index.  Used by
+/// `eval_expr_to_value` to recognise field-access expressions like `p.x`
+/// (struct field) or `pair.0` (tuple positional access).
+///
+/// Returns `(<lhs>, <field>)` when the input has the shape
+/// `<expr>.<simple-name-or-digits>` at top level (i.e. the dot is at
+/// depth 0 across all bracket flavours).  Returns `None` for non-
+/// matching shapes — including chained accesses (`a.b.c`), arithmetic
+/// with `.` (we don't support floats), or anything where the field side
+/// isn't a simple ident / digit run.
+fn split_top_level_dot(expr: &str) -> Option<(&str, &str)> {
+    let expr = expr.trim();
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut last_dot: Option<usize> = None;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'.' if depth == 0 => last_dot = Some(i),
+            _ => {}
+        }
+    }
+    let pos = last_dot?;
+    let lhs = expr[..pos].trim();
+    let field = expr[pos + 1..].trim();
+    if lhs.is_empty() || field.is_empty() {
+        return None;
+    }
+    let valid_field = field.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && field
+            .chars()
+            .next()
+            .map(|c| c.is_alphanumeric() || c == '_')
+            .unwrap_or(false);
+    if !valid_field {
+        return None;
+    }
+    Some((lhs, field))
+}
+
+/// Recognise a Tolk tuple literal `(a, b[, c...])` and return the
+/// element-expression strings.  Returns `None` for non-tuple shapes
+/// — including unit `()` and parenthesised single expressions `(x)`
+/// (only `(a, b)` and longer count as tuple literals).
+fn parse_tuple_literal(expr: &str) -> Option<Vec<String>> {
+    let expr = expr.trim();
+    let inner = expr.strip_prefix('(')?.strip_suffix(')')?;
+    // Top-level paren match: the trailing `)` must close the leading
+    // `(` at depth 0, with nothing past it.
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    for (i, ch) in bytes.iter().enumerate() {
+        match ch {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 && i != expr.len() - 1 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let parts = split_top_level_commas(inner);
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Recognise a Tolk struct literal `Type { field: value, ... }` and
+/// return the type name plus a `Vec<(field_name, value_expr)>`.
+///
+/// The type name must be a simple identifier starting with an upper-
+/// case letter (Tolk convention — `Point`, `Coord`, etc.).  Each field
+/// entry must have the shape `<simple-ident>: <expr>` separated by
+/// top-level commas.  Returns `None` for non-struct-shaped input.
+fn parse_struct_literal(expr: &str) -> Option<(String, Vec<(String, String)>)> {
+    let expr = expr.trim();
+    let brace_open = expr.find('{')?;
+    if !expr.ends_with('}') {
+        return None;
+    }
+    let type_name = expr[..brace_open].trim().to_string();
+    if type_name.is_empty() || !is_simple_identifier(&type_name) {
+        return None;
+    }
+    let first = type_name.chars().next().unwrap();
+    if !first.is_uppercase() {
+        return None;
+    }
+    let inner = &expr[brace_open + 1..expr.len() - 1];
+    let parts = split_top_level_commas(inner);
+    let mut out = Vec::with_capacity(parts.len());
+    for p in parts {
+        let colon = p.find(':')?;
+        let fname = p[..colon].trim().to_string();
+        let fexpr = p[colon + 1..].trim().to_string();
+        if fname.is_empty() || fexpr.is_empty() || !is_simple_identifier(&fname) {
+            return None;
+        }
+        out.push((fname, fexpr));
+    }
+    Some((type_name, out))
 }
 
 #[cfg(test)]
