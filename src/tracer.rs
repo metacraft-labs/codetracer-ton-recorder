@@ -141,6 +141,38 @@ enum Statement {
     /// discarded).  Used for storage-mutation calls like
     /// `set_data(c);`.
     ExprStatement { expr: String, line: u32 },
+    /// `throwIf(<code>, <cond>);` / `throwUnless(<code>, <cond>);`
+    /// — Tolk's pervasive guard idiom.  Unlike the unconditional
+    /// `Throw` / static-sweep `Assert` variants, these MUST evaluate
+    /// the condition at runtime and only fire the Error io_event
+    /// when the gate actually trips (the `mode` field selects which
+    /// truth value trips it).  Implemented inline in
+    /// `execute_statement`; deliberately NOT walked by
+    /// `emit_error_events_for_program` so a non-tripping gate does
+    /// not produce a spurious io_event the way the static `throw` /
+    /// `assert` sweep does for unreachable failure markers.
+    GatedThrow {
+        /// Raw exception-code expression (e.g. `"40"`, `"36"`).
+        code: String,
+        /// Raw condition expression (e.g. `"value == 0"`,
+        /// `"probe >= 7"`).
+        condition: String,
+        /// Selects whether the gate trips on a true or false
+        /// condition.  `Mode::If` = throw when cond is truthy
+        /// (TON's `throwIf`); `Mode::Unless` = throw when cond is
+        /// falsy (TON's `throwUnless`).
+        mode: GateMode,
+        line: u32,
+    },
+}
+
+/// Selector for `Statement::GatedThrow` — see its doc comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateMode {
+    /// `throwIf(<code>, <cond>);` — trip when cond is truthy.
+    If,
+    /// `throwUnless(<code>, <cond>);` — trip when cond is falsy.
+    Unless,
 }
 
 /// A run-time Tolk value flowing through the hand-rolled evaluator.
@@ -173,20 +205,31 @@ enum Value {
         fields: Vec<(String, Value)>,
     },
     /// In-progress TON Builder.  `payload` records the integer
-    /// arguments handed to `storeInt` / `storeUint` calls in the
-    /// order they were appended; the Slice produced by
-    /// `cell.beginParse()` consumes them via `loadInt` in the same
-    /// order.  This is a recorder-side abstraction — no real cell
-    /// bits are constructed — but it is sufficient to round-trip the
-    /// values used in `cell_ops_test.tolk`.
-    Builder { payload: Vec<i64> },
+    /// arguments handed to `storeInt` / `storeUint` / `storeAddress`
+    /// calls in the order they were appended; the Slice produced by
+    /// `cell.beginParse()` consumes them via `loadInt` /
+    /// `loadAddress` in the same order.  `refs` is a parallel queue
+    /// of sub-cells appended by `storeRef` / `storeMaybeRef`;
+    /// `loadRef` / `loadMaybeRef` pop from the front via a separate
+    /// cursor maintained on the Slice side.  This is a recorder-side
+    /// abstraction — no real cell bits are constructed — but it's
+    /// sufficient to round-trip the values used in
+    /// `cell_ops_test.tolk` and `builder_refs_test.tolk`.
+    Builder { payload: Vec<i64>, refs: Vec<Vec<i64>> },
     /// Finalised cell, produced by `Builder::endCell` or a chained
     /// `beginCell().storeInt(...).endCell()` expression.
-    Cell { payload: Vec<i64> },
+    Cell { payload: Vec<i64>, refs: Vec<Vec<i64>> },
     /// Read-cursor slice produced by `Cell::beginParse`.  `payload`
     /// is the same data the originating cell carried; `pos` advances
-    /// as `loadInt(N)` calls consume entries.
-    Slice { payload: Vec<i64>, pos: usize },
+    /// as `loadInt(N)` calls consume entries.  `refs` is the
+    /// parallel ref queue inherited from the cell; `ref_pos`
+    /// advances as `loadRef` / `loadMaybeRef` consume sub-cells.
+    Slice {
+        payload: Vec<i64>,
+        pos: usize,
+        refs: Vec<Vec<i64>>,
+        ref_pos: usize,
+    },
 }
 
 impl Value {
@@ -361,24 +404,87 @@ impl TolkTracer {
         }
     }
 
-    /// Evaluate the program starting from `main()`.
+    /// Evaluate the program starting from its entry point.
+    ///
+    /// Tolk's actual on-chain entry points are
+    /// `onInternalMessage(...)` (called when the contract receives an
+    /// internal message from another contract) and
+    /// `onExternalMessage(...)` (called when the contract receives an
+    /// external message from outside the chain).  Real-world contracts
+    /// don't declare a `main()` — the TVM invokes whichever hook is
+    /// appropriate for the incoming message.  The legacy hand-rolled
+    /// fixtures here still use `main()` as a synthetic dispatch point,
+    /// so we keep that resolver and only fall back to the TON
+    /// entry-point hooks when no `main` is declared.  When BOTH
+    /// hooks are present we evaluate them in the canonical order
+    /// (internal-before-external) so the trace shape is deterministic.
     fn evaluate_program(&mut self, source_path: &Path, functions: &[FunctionDef]) -> Result<()> {
         // Build a function lookup table.
         let func_map: HashMap<String, &FunctionDef> =
             functions.iter().map(|f| (f.name.clone(), f)).collect();
 
-        // Find and call main.
-        let main_fn = func_map
-            .get("main")
-            .ok_or_else(|| eyre!("no main function found in Tolk program"))?;
-
         let mut env: HashMap<String, Value> = HashMap::new();
-        // Merge main() into <toplevel> by skipping its Call/Return events.
-        // TraceWriter::start() already created <toplevel> at depth 0. Emitting
-        // register_call(main) would push all main-body steps to depth 1 and any
-        // nested calls (e.g. compute()) to depth 2. The db-backend's step-over
-        // from depth 0 would then skip every step, breaking navigation.
-        self.evaluate_function(source_path, main_fn, &func_map, &mut env, true)?;
+
+        // Preferred entry: `main()`, used by the legacy linear
+        // fixtures.  Merged into <toplevel> (is_entry_point=true) so
+        // its body runs at depth 0 — see the comment in the original
+        // arm for the navigation rationale.
+        if let Some(main_fn) = func_map.get("main") {
+            self.evaluate_function(
+                source_path,
+                main_fn,
+                &func_map,
+                &mut env,
+                true,
+                &[],
+            )?;
+            return Ok(());
+        }
+
+        // No main() declared: fall back to TON's actual entry points.
+        // Tolk contracts may declare either or both of these hooks;
+        // we drive each one in canonical order with synthetic int
+        // arguments (0 for every formal) so the body executes and
+        // surfaces step + var events.  Bigger fixtures with rich
+        // entry-point signatures can extend this stub once the
+        // recorder learns to synthesise representative message
+        // payloads.
+        let entry_names = ["onInternalMessage", "onExternalMessage"];
+        let present: Vec<&str> = entry_names
+            .iter()
+            .copied()
+            .filter(|n| func_map.contains_key(*n))
+            .collect();
+
+        if present.is_empty() {
+            return Err(eyre!(
+                "no entry point found in Tolk program: declare \
+                 `main()`, `onInternalMessage(...)`, or \
+                 `onExternalMessage(...)`"
+            ));
+        }
+
+        for (idx, name) in present.iter().enumerate() {
+            let entry_fn = func_map.get(*name).expect("present-filter");
+            let synthetic_args: Vec<Value> = entry_fn
+                .params
+                .iter()
+                .map(|_| Value::Int(0))
+                .collect();
+            // First entry merges into <toplevel> to keep its body at
+            // depth 0 (same constraint as `main()`); any subsequent
+            // entry runs as a non-entry-point call so its body opens
+            // a fresh call_entry / call_exit pair.
+            let is_first = idx == 0;
+            self.evaluate_function(
+                source_path,
+                entry_fn,
+                &func_map,
+                &mut env,
+                is_first,
+                &synthetic_args,
+            )?;
+        }
 
         Ok(())
     }
@@ -440,24 +546,29 @@ impl TolkTracer {
             // but the int round-trip is what `cell_ops_test.tolk`
             // exercises and the only payload downstream tools render
             // today.
-            Value::Builder { payload } => {
+            Value::Builder { payload, refs } => {
                 let type_id = self.ensure_raw_type_id("TolkBuilder");
                 ValueRecord::Raw {
-                    r: format_payload("Builder", payload),
+                    r: format_payload_with_refs("Builder", payload, refs),
                     type_id,
                 }
             }
-            Value::Cell { payload } => {
+            Value::Cell { payload, refs } => {
                 let type_id = self.ensure_raw_type_id("TolkCell");
                 ValueRecord::Raw {
-                    r: format_payload("Cell", payload),
+                    r: format_payload_with_refs("Cell", payload, refs),
                     type_id,
                 }
             }
-            Value::Slice { payload, pos } => {
+            Value::Slice {
+                payload,
+                pos,
+                refs,
+                ref_pos,
+            } => {
                 let type_id = self.ensure_raw_type_id("TolkSlice");
-                let mut text = format_payload("Slice", payload);
-                text.push_str(&format!(" @{pos}"));
+                let mut text = format_payload_with_refs("Slice", payload, refs);
+                text.push_str(&format!(" @{pos}/r{ref_pos}"));
                 ValueRecord::Raw { r: text, type_id }
             }
         }
@@ -481,6 +592,15 @@ impl TolkTracer {
     /// When `is_entry_point` is true, the Call/Return events for this function
     /// are suppressed — its body is evaluated directly at the caller's depth
     /// (merged into `<toplevel>`).
+    ///
+    /// `args` carries the resolved `Value`s for the function's formal
+    /// parameters (in source order).  They are bound into the callee's
+    /// local env BEFORE the body executes, so the body can reference
+    /// each parameter by name.  Mirrors the cardano `a393608` arg-
+    /// passing pattern.  Extra args (more than `func.params.len()`)
+    /// are ignored; missing args leave the corresponding param unbound
+    /// (the body falls through any reference to that name as an
+    /// unknown identifier rather than panicking).
     fn evaluate_function(
         &mut self,
         source_path: &Path,
@@ -488,6 +608,7 @@ impl TolkTracer {
         func_map: &HashMap<String, &FunctionDef>,
         _parent_env: &mut HashMap<String, Value>,
         is_entry_point: bool,
+        args: &[Value],
     ) -> Result<Option<Value>> {
         // Register function metadata (for function list / calltrace).
         let fn_id = TraceWriter::ensure_function_id(
@@ -502,28 +623,34 @@ impl TolkTracer {
             // Stage canonical Call args via writer.arg(name, value).
             //
             // The Tolk source carries a formal parameter list per
-            // function (`fun foo(a: int, b: int): int`). We use that
-            // list here so the calltrace pane's `.call-arg` rows show
-            // each declared parameter rather than the empty list that
-            // pre-fix register_call(fn_id, vec![]) produced.
-            //
-            // Concrete values are NONE_VALUE for now: the current Tolk
-            // parser only recognises zero-arg call sites
-            // (`compute()`), so the caller has no way to surface arg
-            // values to this point. Extending parse_function_call /
-            // evaluate_function to thread arg expressions would let
-            // the staging path emit live values; tracked as an
-            // open follow-up in AUDIT-CTFS-2026-05.md (parallel to
-            // PolkaVM 1.55 ink!-metadata symbolic decoding and Miden
-            // 1.56 per-procedure ABI / argument-name parsing).
-            for (param_name, _param_type) in &func.params {
-                let _ = TraceWriter::arg(&mut *self.writer, param_name, NONE_VALUE);
+            // function (`fun foo(a: int, b: int): int`).  Now that
+            // `parse_call_with_args` threads the resolved actuals
+            // through to the callee (see `eval_expr_to_value` /
+            // `eval_expr`), we surface each one as a real
+            // `ValueRecord` instead of the historical `NONE_VALUE`
+            // placeholder.  Formals without a matching actual still
+            // surface as `NONE_VALUE` so the calltrace row remains
+            // present (matches the "best-effort, never panic"
+            // discipline used elsewhere in the recorder).
+            for (idx, (param_name, _param_type)) in func.params.iter().enumerate() {
+                let arg_value = match args.get(idx) {
+                    Some(v) => self.value_to_record(v),
+                    None => NONE_VALUE,
+                };
+                let _ = TraceWriter::arg(&mut *self.writer, param_name, arg_value);
             }
             TraceWriter::register_call(&mut *self.writer, fn_id, vec![]);
         }
 
         // Local variable environment for this function.
         let mut env: HashMap<String, Value> = HashMap::new();
+        // Bind formal params to actual arg values.  Zip on shorter so
+        // calls with too-few actuals still produce a (degraded but
+        // consistent) trace rather than panicking.  This is the
+        // recorder-side counterpart to the cardano `a393608` pattern.
+        for ((param_name, _param_type), arg_val) in func.params.iter().zip(args.iter()) {
+            env.insert(param_name.clone(), arg_val.clone());
+        }
         // Symbolic stack tracker: mirrors TVM execution to reconstruct
         // source-level variable names from stack positions.  Currently
         // only consulted by the int-arithmetic path — control-flow
@@ -594,17 +721,43 @@ impl TolkTracer {
         let resolved = resolve_field_accesses(expr, env);
         let expr_str: &str = &resolved;
 
-        // Check for function call: <name>()
-        if let Some(call_name) = parse_function_call(expr_str) {
-            if let Some(callee) = func_map.get(&call_name) {
+        // Check for function call: `<name>(<args>)` — zero-or-more
+        // args.  Each actual is evaluated in the caller's env BEFORE
+        // recursing into the callee, mirroring the cardano `a393608`
+        // arg-passing pattern.  An actual that fails to evaluate
+        // aborts the call (the body falls through to the TVM compile
+        // path so callees referencing the param surface as unknown
+        // identifiers — same best-effort discipline used everywhere
+        // else in the recorder).
+        if let Some((call_name, arg_exprs)) = parse_call_with_args(expr_str) {
+            if let Some(callee) = func_map.get(call_name) {
                 let callee = (*callee).clone();
-                let mut dummy_env: HashMap<String, Value> = HashMap::new();
-                let result =
-                    self.evaluate_function(source_path, &callee, func_map, &mut dummy_env, false)?;
-                // Only Int return values feed back into the TVM
-                // arithmetic pipeline; structured returns surface via
-                // `eval_expr_to_value` directly.
-                return Ok(result.and_then(|v| v.as_i64()));
+                let mut arg_vals: Vec<Value> = Vec::with_capacity(arg_exprs.len());
+                let mut all_args_ok = true;
+                for arg_expr in &arg_exprs {
+                    match self.eval_expr_to_value(arg_expr, env, source_path, func_map)? {
+                        Some(v) => arg_vals.push(v),
+                        None => {
+                            all_args_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if all_args_ok {
+                    let mut dummy_env: HashMap<String, Value> = HashMap::new();
+                    let result = self.evaluate_function(
+                        source_path,
+                        &callee,
+                        func_map,
+                        &mut dummy_env,
+                        false,
+                        &arg_vals,
+                    )?;
+                    // Only Int return values feed back into the TVM
+                    // arithmetic pipeline; structured returns surface
+                    // via `eval_expr_to_value` directly.
+                    return Ok(result.and_then(|v| v.as_i64()));
+                }
             }
         }
 
@@ -739,23 +892,42 @@ impl TolkTracer {
             }
         }
 
-        // 5. Function call returning a structured value.  We only
-        // intercept calls whose result is non-Int — Int-returning
-        // calls fall through to the existing `eval_expr` path so the
-        // TVM pipeline continues to drive arithmetic.
-        if let Some(call_name) = parse_function_call(expr) {
-            if let Some(callee) = func_map.get(&call_name) {
+        // 5. Function call.  Once `parse_call_with_args` identifies
+        // `<name>(<args>)` AND `<name>` resolves to a known
+        // user-defined function in `func_map`, we own the evaluation
+        // entirely — the result (Some or None) is returned directly
+        // so we don't accidentally re-invoke the callee from the
+        // int-only `eval_expr` fallback below.  This matters for
+        // calls that abort via a runtime-tripping
+        // `Statement::GatedThrow` (the callee's `BlockExit::Aborted`
+        // becomes `Ok(None)` here): without the explicit `return`,
+        // the fallback would re-invoke the callee and double-emit
+        // the Error io_event.
+        if let Some((call_name, arg_exprs)) = parse_call_with_args(expr) {
+            if let Some(callee) = func_map.get(call_name) {
                 let callee = (*callee).clone();
-                let mut dummy_env: HashMap<String, Value> = HashMap::new();
-                let result = self.evaluate_function(
-                    source_path,
-                    &callee,
-                    func_map,
-                    &mut dummy_env,
-                    false,
-                )?;
-                if let Some(v) = result {
-                    return Ok(Some(v));
+                let mut arg_vals: Vec<Value> = Vec::with_capacity(arg_exprs.len());
+                let mut all_args_ok = true;
+                for arg_expr in &arg_exprs {
+                    match self.eval_expr_to_value(arg_expr, env, source_path, func_map)? {
+                        Some(v) => arg_vals.push(v),
+                        None => {
+                            all_args_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if all_args_ok {
+                    let mut dummy_env: HashMap<String, Value> = HashMap::new();
+                    let result = self.evaluate_function(
+                        source_path,
+                        &callee,
+                        func_map,
+                        &mut dummy_env,
+                        false,
+                        &arg_vals,
+                    )?;
+                    return Ok(result);
                 }
             }
         }
@@ -999,6 +1171,51 @@ impl TolkTracer {
                 let _ = self.eval_expr_to_value(expr, env, source_path, func_map)?;
                 Ok(BlockExit::Fallthrough)
             }
+            Statement::GatedThrow {
+                code,
+                condition,
+                mode,
+                line,
+            } => {
+                // Emit a Step event for the guard line so the branch
+                // shows up in the calltrace pane regardless of whether
+                // the gate trips.
+                TraceWriter::register_step(
+                    &mut *self.writer,
+                    source_path,
+                    Line(*line as i64),
+                );
+                // Evaluate the condition.  `eval_cond` already
+                // normalises any TVM-side `-1` ("true") and missing
+                // values to a Rust `bool`; we then route that against
+                // the gate selector.
+                let cond_val = self.eval_cond(condition, env, source_path, func_map)?;
+                let trips = match mode {
+                    GateMode::If => cond_val,
+                    GateMode::Unless => !cond_val,
+                };
+                if trips {
+                    let label = match mode {
+                        GateMode::If => "throwIf",
+                        GateMode::Unless => "throwUnless",
+                    };
+                    let message = format!("{label}: code {code}");
+                    TraceWriter::register_special_event(
+                        &mut *self.writer,
+                        EventLogKind::Error,
+                        "TolkThrow",
+                        &message,
+                    );
+                    // Propagate Aborted so enclosing loops / branches
+                    // stop executing past the failure marker.  Unlike
+                    // the unconditional `Throw` case, the caller can
+                    // recover by short-circuiting the current function
+                    // (Tolk has no try/catch in the recorder's view).
+                    Ok(BlockExit::Aborted)
+                } else {
+                    Ok(BlockExit::Fallthrough)
+                }
+            }
         }
     }
 
@@ -1041,49 +1258,68 @@ impl TolkTracer {
     ) -> Result<Option<Value>> {
         let expr = expr.trim();
 
-        // Global helpers: `beginCell()`, `get_data()`, `set_data(<expr>)`.
+        // Global helpers: `beginCell()`, `get_data()`/`load_data()`,
+        // `set_data(<expr>)`/`save_data(<expr>)`.  `load_data` /
+        // `save_data` are the canonical Tolk names for TON persistent
+        // storage (see the per-contract `Storage` struct idiom in
+        // `persistent_storage_test.tolk`); `get_data` / `set_data`
+        // are their legacy FunC-era aliases.  Both surface as the
+        // same Read / Write io_events tagged `"TolkStorage"` so the
+        // frontend's storage panel doesn't need to know which name
+        // the source happens to use.
         if let Some((name, args)) = parse_call_with_args(expr) {
             if name == "beginCell" && args.is_empty() {
-                return Ok(Some(Value::Builder { payload: Vec::new() }));
+                return Ok(Some(Value::Builder {
+                    payload: Vec::new(),
+                    refs: Vec::new(),
+                }));
             }
-            if name == "get_data" && args.is_empty() {
-                let payload = match &self.storage_data {
-                    Some(Value::Cell { payload }) => payload.clone(),
-                    Some(Value::Builder { payload }) => payload.clone(),
-                    _ => Vec::new(),
+            if (name == "get_data" || name == "load_data") && args.is_empty() {
+                let (payload, refs) = match &self.storage_data {
+                    Some(Value::Cell { payload, refs }) => (payload.clone(), refs.clone()),
+                    Some(Value::Builder { payload, refs }) => (payload.clone(), refs.clone()),
+                    _ => (Vec::new(), Vec::new()),
                 };
-                let summary = format_payload("Cell", &payload);
+                let summary = format_payload_with_refs("Cell", &payload, &refs);
                 TraceWriter::register_special_event(
                     &mut *self.writer,
                     EventLogKind::Read,
                     "TolkStorage",
-                    &format!("get_data: {summary}"),
+                    &format!("{name}: {summary}"),
                 );
-                return Ok(Some(Value::Cell { payload }));
+                return Ok(Some(Value::Cell { payload, refs }));
             }
-            if name == "set_data" && args.len() == 1 {
+            if (name == "set_data" || name == "save_data") && args.len() == 1 {
                 if let Some(val) =
                     self.eval_expr_to_value(&args[0], env, source_path, func_map)?
                 {
                     let summary = match &val {
-                        Value::Cell { payload } => format_payload("Cell", payload),
-                        Value::Builder { payload } => format_payload("Builder", payload),
+                        Value::Cell { payload, refs } => {
+                            format_payload_with_refs("Cell", payload, refs)
+                        }
+                        Value::Builder { payload, refs } => {
+                            format_payload_with_refs("Builder", payload, refs)
+                        }
                         _ => "<non-cell>".to_string(),
                     };
                     TraceWriter::register_special_event(
                         &mut *self.writer,
                         EventLogKind::Write,
                         "TolkStorage",
-                        &format!("set_data: {summary}"),
+                        &format!("{name}: {summary}"),
                     );
                     self.storage_data = Some(val);
                 }
-                // `set_data(c);` is statement-shaped; we still return
-                // something concrete so the surrounding expression
-                // doesn't accidentally fall through to the int-only
-                // TVM path.  An empty `Cell` is harmless because the
-                // call doesn't show up on a value-bearing RHS.
-                return Ok(Some(Value::Cell { payload: Vec::new() }));
+                // `set_data(c);` / `save_data(c);` are statement-
+                // shaped; we still return something concrete so the
+                // surrounding expression doesn't accidentally fall
+                // through to the int-only TVM path.  An empty `Cell`
+                // is harmless because the call doesn't show up on a
+                // value-bearing RHS.
+                return Ok(Some(Value::Cell {
+                    payload: Vec::new(),
+                    refs: Vec::new(),
+                }));
             }
         }
 
@@ -1092,71 +1328,201 @@ impl TolkTracer {
         // (`beginCell().storeInt(42, 32).endCell()`) recurse left-
         // first.
         if let Some((lhs_str, method, arg_strs)) = parse_method_call(expr) {
-            // Evaluate the LHS first.  This may itself emit io_events
-            // (e.g. `get_data()` chained with `.beginParse()`).
+            // For ref-bearing methods (storeRef / storeMaybeRef /
+            // storeSlice) we need the actual argument Value (a Cell
+            // or Slice), not an int.  Evaluate the args BEFORE the
+            // LHS so the resolution order matches the source-level
+            // read: the arg side-effects run first.  Pre-M10 every
+            // recognised method here took int args only, so the eager
+            // int-projection below remained valid; the new arms
+            // consult `arg_value_records` directly for the cell-bearing
+            // args.
+            let mut arg_value_records: Vec<Option<Value>> =
+                Vec::with_capacity(arg_strs.len());
+            for a in &arg_strs {
+                let v = self.eval_expr_to_value(a, env, source_path, func_map)?;
+                arg_value_records.push(v);
+            }
+            // Evaluate the LHS after the args (matches the historical
+            // order — chained calls like `b.storeInt(...).endCell()`
+            // recurse left-first via the dot split).
             let base = match self.eval_expr_to_value(lhs_str, env, source_path, func_map)? {
                 Some(v) => v,
                 None => return Ok(None),
             };
-            // Evaluate the args eagerly — every cell-op argument we
-            // care about is an int.
-            let mut arg_vals = Vec::with_capacity(arg_strs.len());
-            for a in &arg_strs {
-                let v = self
-                    .eval_expr_to_value(a, env, source_path, func_map)?
-                    .and_then(|v| v.as_i64());
-                arg_vals.push(v);
-            }
+            // Project the int-bearing args for the legacy int-only
+            // shapes (storeInt / storeUint / loadInt / ...).
+            let arg_ints: Vec<Option<i64>> = arg_value_records
+                .iter()
+                .map(|v| v.as_ref().and_then(|x| x.as_i64()))
+                .collect();
 
             match method {
-                "storeInt" | "storeUint" | "storeRef" => {
-                    let mut payload = match base {
-                        Value::Builder { payload } => payload,
-                        Value::Cell { payload } => payload,
+                "storeInt" | "storeUint" => {
+                    let (mut payload, refs) = match base {
+                        Value::Builder { payload, refs } => (payload, refs),
+                        Value::Cell { payload, refs } => (payload, refs),
                         _ => return Ok(None),
                     };
-                    if let Some(Some(v)) = arg_vals.first() {
+                    if let Some(Some(v)) = arg_ints.first() {
                         payload.push(*v);
                     }
-                    return Ok(Some(Value::Builder { payload }));
+                    return Ok(Some(Value::Builder { payload, refs }));
+                }
+                // `storeRef(<cell>)`: append the entire ref-cell to
+                // the builder's ref queue.  `storeMaybeRef(<cell>)`:
+                // same as storeRef when the arg is a real cell;
+                // appends an empty marker cell when the arg is
+                // missing / unresolvable (TON's null-ref convention).
+                // `storeSlice(<slice>)`: flatten the slice's
+                // remaining payload onto the builder's int payload
+                // (Tolk's bit-level concat); refs from the slice are
+                // appended to the builder's ref queue.
+                "storeRef" | "storeMaybeRef" => {
+                    let (payload, mut refs) = match base {
+                        Value::Builder { payload, refs } => (payload, refs),
+                        Value::Cell { payload, refs } => (payload, refs),
+                        _ => return Ok(None),
+                    };
+                    let ref_payload = match arg_value_records.first().and_then(|v| v.clone()) {
+                        Some(Value::Cell { payload: p, .. }) => p,
+                        Some(Value::Builder { payload: p, .. }) => p,
+                        Some(Value::Slice { payload: p, pos, .. }) => {
+                            // Drain the slice's remaining int payload
+                            // (positions >= pos).  This matches the
+                            // TON convention that a slice converted
+                            // to a ref carries only its unconsumed
+                            // tail.
+                            p[pos..].to_vec()
+                        }
+                        Some(Value::Int(v)) => vec![v],
+                        _ => Vec::new(),
+                    };
+                    refs.push(ref_payload);
+                    return Ok(Some(Value::Builder { payload, refs }));
+                }
+                "storeSlice" => {
+                    let (mut payload, mut refs) = match base {
+                        Value::Builder { payload, refs } => (payload, refs),
+                        Value::Cell { payload, refs } => (payload, refs),
+                        _ => return Ok(None),
+                    };
+                    if let Some(Some(Value::Slice {
+                        payload: sp,
+                        pos,
+                        refs: sr,
+                        ref_pos,
+                    })) = arg_value_records.first().map(|v| v.clone())
+                    {
+                        payload.extend_from_slice(&sp[pos..]);
+                        for r in sr.into_iter().skip(ref_pos) {
+                            refs.push(r);
+                        }
+                    }
+                    return Ok(Some(Value::Builder { payload, refs }));
+                }
+                // `storeAddress(<int>)`: TON's wallet/account address
+                // surfaces here as a single int (the recorder doesn't
+                // model the bit-level address wire format; the int
+                // round-trip is what every fixture verifies).  Mirrors
+                // `storeInt` semantically but is broken out so the
+                // diff-against-source is readable.
+                "storeAddress" => {
+                    let (mut payload, refs) = match base {
+                        Value::Builder { payload, refs } => (payload, refs),
+                        Value::Cell { payload, refs } => (payload, refs),
+                        _ => return Ok(None),
+                    };
+                    if let Some(Some(v)) = arg_ints.first() {
+                        payload.push(*v);
+                    }
+                    return Ok(Some(Value::Builder { payload, refs }));
                 }
                 "endCell" => {
-                    let payload = match base {
-                        Value::Builder { payload } => payload,
-                        Value::Cell { payload } => payload,
+                    let (payload, refs) = match base {
+                        Value::Builder { payload, refs } => (payload, refs),
+                        Value::Cell { payload, refs } => (payload, refs),
                         _ => return Ok(None),
                     };
-                    return Ok(Some(Value::Cell { payload }));
+                    return Ok(Some(Value::Cell { payload, refs }));
                 }
                 "beginParse" => {
-                    let payload = match base {
-                        Value::Cell { payload } => payload,
-                        Value::Builder { payload } => payload,
-                        Value::Slice { payload, .. } => payload,
+                    let (payload, refs) = match base {
+                        Value::Cell { payload, refs } => (payload, refs),
+                        Value::Builder { payload, refs } => (payload, refs),
+                        Value::Slice {
+                            payload, refs, ..
+                        } => (payload, refs),
                         _ => return Ok(None),
                     };
-                    return Ok(Some(Value::Slice { payload, pos: 0 }));
+                    return Ok(Some(Value::Slice {
+                        payload,
+                        pos: 0,
+                        refs,
+                        ref_pos: 0,
+                    }));
                 }
-                "loadInt" | "loadUint" => {
-                    let (payload, pos) = match base {
-                        Value::Slice { payload, pos } => (payload, pos),
+                "loadInt" | "loadUint" | "loadAddress" => {
+                    let (payload, pos, refs, ref_pos) = match base {
+                        Value::Slice {
+                            payload,
+                            pos,
+                            refs,
+                            ref_pos,
+                        } => (payload, pos, refs, ref_pos),
                         _ => return Ok(None),
                     };
                     let value = payload.get(pos).copied().unwrap_or(0);
                     let new_slice = Value::Slice {
                         payload,
                         pos: pos + 1,
+                        refs,
+                        ref_pos,
                     };
                     // If the LHS was a simple identifier, mutate the
-                    // env so subsequent `loadInt` calls advance the
-                    // cursor.  Anything more complex (chained calls,
-                    // expressions) just yields the int — the caller
-                    // can't observe the slice anyway.
+                    // env so subsequent `loadInt`/`loadAddress` calls
+                    // advance the cursor.  Anything more complex
+                    // (chained calls, expressions) just yields the
+                    // int — the caller can't observe the slice
+                    // anyway.
                     let lhs_ident = lhs_str.trim();
                     if is_simple_identifier(lhs_ident) {
                         env.insert(lhs_ident.to_string(), new_slice);
                     }
                     return Ok(Some(Value::Int(value)));
+                }
+                // `loadRef()` / `loadMaybeRef()`: pop the next sub-
+                // cell from the slice's ref queue.  Returns an empty
+                // Cell when exhausted (matches the recorder's
+                // "best-effort, never panic" discipline).  As with
+                // `loadInt`, mutate the env when the LHS is a simple
+                // identifier so subsequent loads see the advanced
+                // ref cursor.
+                "loadRef" | "loadMaybeRef" => {
+                    let (payload, pos, refs, ref_pos) = match base {
+                        Value::Slice {
+                            payload,
+                            pos,
+                            refs,
+                            ref_pos,
+                        } => (payload, pos, refs, ref_pos),
+                        _ => return Ok(None),
+                    };
+                    let popped = refs.get(ref_pos).cloned().unwrap_or_default();
+                    let new_slice = Value::Slice {
+                        payload,
+                        pos,
+                        refs,
+                        ref_pos: ref_pos + 1,
+                    };
+                    let lhs_ident = lhs_str.trim();
+                    if is_simple_identifier(lhs_ident) {
+                        env.insert(lhs_ident.to_string(), new_slice);
+                    }
+                    return Ok(Some(Value::Cell {
+                        payload: popped,
+                        refs: Vec::new(),
+                    }));
                 }
                 _ => return Ok(None),
             }
@@ -1203,6 +1569,20 @@ fn format_payload(kind: &'static str, payload: &[i64]) -> String {
         let parts: Vec<String> = payload.iter().map(|v| v.to_string()).collect();
         format!("{kind}([{}])", parts.join(", "))
     }
+}
+
+/// Format a Builder/Cell/Slice payload that may carry sub-cell refs
+/// (`builder_refs_test.tolk`).  When `refs` is empty the output
+/// matches `format_payload` exactly so the cell-ops fixture's pinned
+/// payload strings continue to round-trip; when refs are present they
+/// are appended as `refs=[Cell(...), ...]` after the int payload.
+fn format_payload_with_refs(kind: &'static str, payload: &[i64], refs: &[Vec<i64>]) -> String {
+    let head = format_payload(kind, payload);
+    if refs.is_empty() {
+        return head;
+    }
+    let parts: Vec<String> = refs.iter().map(|r| format_payload("Cell", r)).collect();
+    format!("{head} refs=[{}]", parts.join(", "))
 }
 
 /// Project a structured `Value` env down to the int-only sub-env that
@@ -1720,6 +2100,51 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         }
     }
 
+    // throwIf / throwUnless: `throwIf(<code>, <cond>);` and
+    // `throwUnless(<code>, <cond>);` — Tolk's gated-throw guard idiom
+    // (the pervasive shape behind `throwIf(40, recipient == sender);`
+    // and `throwUnless(36, msg::value() >= price);` in real-world
+    // contracts).  Both must evaluate the condition at runtime and
+    // only fire the matching Error io_event when the gate trips;
+    // implementation lives in the `Statement::GatedThrow` arm of
+    // `execute_statement`.  Be lenient about whitespace between the
+    // function name and the opening paren so both
+    // `throwIf(...)` and `throwIf (...)` parse.
+    for (prefix, mode) in [
+        ("throwIf(", GateMode::If),
+        ("throwIf (", GateMode::If),
+        ("throwUnless(", GateMode::Unless),
+        ("throwUnless (", GateMode::Unless),
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            // Strip the trailing `);` (and any extra semicolons) so
+            // we're left with the bare arg pair.
+            let inner = rest
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .trim_end_matches(')')
+                .trim();
+            // Split on the FIRST top-level comma — the first arg is
+            // the error code, the second is the condition expression
+            // (which may itself contain commas inside calls, e.g.
+            // `throwUnless(36, has_at_least(balance, price))`).
+            let parts = split_top_level_commas(inner);
+            if parts.len() >= 2 {
+                let code = parts[0].trim().to_string();
+                let condition = parts[1..].join(", ").trim().to_string();
+                if !code.is_empty() && !condition.is_empty() {
+                    return Some(Statement::GatedThrow {
+                        code,
+                        condition,
+                        mode,
+                        line: line_num,
+                    });
+                }
+            }
+        }
+    }
+
     // bare assignment: `<name> = <expr>;`.  The LHS must be a simple
     // identifier (loop counters, accumulators, branch-arm sinks); we
     // do not support qualified or indexed targets here because the
@@ -1830,6 +2255,12 @@ fn find_top_level_assign(s: &str) -> Option<usize> {
 
 /// Check if an expression is a simple function call like `compute()`.
 /// Returns the function name if so.
+///
+/// Retained for unit-test coverage of the legacy zero-arg recognition
+/// path; production call sites use `parse_call_with_args` so they can
+/// thread positional arguments through to the callee (see the M10
+/// `arg_passing_test.tolk` fixture).
+#[cfg(test)]
 fn parse_function_call(expr: &str) -> Option<String> {
     let expr = expr.trim();
     if let Some(name) = expr.strip_suffix("()") {
