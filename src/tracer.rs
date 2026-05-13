@@ -46,10 +46,24 @@ struct FunctionDef {
 /// A parsed statement in a Tolk function body.
 #[derive(Debug, Clone)]
 enum Statement {
-    /// `var <name>: <type> = <expr>;` or `val <name>: <type> = <expr>;`
+    /// `var <name>[: <type>] = <expr>;` or `val <name>[: <type>] = <expr>;`
+    ///
+    /// `type_name` is `None` for the typeless `var b = beginCell();`
+    /// shape that Tolk allows for Cell / Slice / Builder bindings —
+    /// the recorder defaults the on-trace type id to `int` so these
+    /// continue to round-trip through `register_variable_with_full_value`
+    /// even when no annotation is present.
     VarBinding {
         name: String,
-        type_name: String,
+        type_name: Option<String>,
+        expr: String,
+        line: u32,
+    },
+    /// `<name> = <expr>;` — bare assignment to an already-bound
+    /// variable.  Required for loop bodies like `total = total + i;`
+    /// and branch-arm rebindings like `sign = -1;`.
+    Assign {
+        name: String,
         expr: String,
         line: u32,
     },
@@ -89,6 +103,44 @@ enum Statement {
         #[allow(dead_code)]
         line: u32,
     },
+    /// `if (cond) { ... } [else if (cond) { ... }]* [else { ... }]?`
+    ///
+    /// The recorder's brace-tracking parser collapses
+    /// `else if (cond) { ... }` into a chained `If` whose `else_block`
+    /// is a single-element `Vec<Statement>` containing another `If`.
+    /// `then_block` always exists; `else_block` is empty when no
+    /// `else` arm is present.
+    If {
+        cond: String,
+        then_block: Vec<Statement>,
+        else_block: Vec<Statement>,
+        line: u32,
+    },
+    /// `while (cond) { ... }` — top-tested loop.
+    While {
+        cond: String,
+        body: Vec<Statement>,
+        line: u32,
+    },
+    /// `repeat (count) { ... }` — fixed-count loop.  `count_expr` is
+    /// evaluated once before the loop starts.
+    Repeat {
+        count_expr: String,
+        body: Vec<Statement>,
+        line: u32,
+    },
+    /// `do { ... } until (cond);` — bottom-tested loop.  The body is
+    /// always executed at least once; `cond` is checked after each
+    /// iteration and the loop exits when it evaluates truthy.
+    DoUntil {
+        body: Vec<Statement>,
+        cond: String,
+        line: u32,
+    },
+    /// `<callee>(...);` invoked as a statement (return value
+    /// discarded).  Used for storage-mutation calls like
+    /// `set_data(c);`.
+    ExprStatement { expr: String, line: u32 },
 }
 
 /// A run-time Tolk value flowing through the hand-rolled evaluator.
@@ -120,6 +172,21 @@ enum Value {
         type_name: String,
         fields: Vec<(String, Value)>,
     },
+    /// In-progress TON Builder.  `payload` records the integer
+    /// arguments handed to `storeInt` / `storeUint` calls in the
+    /// order they were appended; the Slice produced by
+    /// `cell.beginParse()` consumes them via `loadInt` in the same
+    /// order.  This is a recorder-side abstraction — no real cell
+    /// bits are constructed — but it is sufficient to round-trip the
+    /// values used in `cell_ops_test.tolk`.
+    Builder { payload: Vec<i64> },
+    /// Finalised cell, produced by `Builder::endCell` or a chained
+    /// `beginCell().storeInt(...).endCell()` expression.
+    Cell { payload: Vec<i64> },
+    /// Read-cursor slice produced by `Cell::beginParse`.  `payload`
+    /// is the same data the originating cell carried; `pos` advances
+    /// as `loadInt(N)` calls consume entries.
+    Slice { payload: Vec<i64>, pos: usize },
 }
 
 impl Value {
@@ -143,6 +210,14 @@ pub struct TolkTracer {
     writer: Box<dyn TraceWriter + Send>,
     /// Registered type IDs for Tolk types.
     type_ids: HashMap<String, codetracer_trace_types::TypeId>,
+    /// In-memory shadow of the on-chain persistent storage cell, set
+    /// via `set_data(c)` and re-fetched via `get_data()`.  This is a
+    /// recorder-side abstraction — no real TVM persistent storage is
+    /// touched — but it is sufficient to round-trip the values used
+    /// in `cell_ops_test.tolk`.  A `None` value means storage hasn't
+    /// been written yet (the recorder still synthesises an empty
+    /// `Cell` on read so downstream code doesn't blow up).
+    storage_data: Option<Value>,
 }
 
 impl TolkTracer {
@@ -165,6 +240,7 @@ impl TolkTracer {
         let mut tracer = TolkTracer {
             writer: create_trace_writer(&program_str, &[], CTFS_FORMAT),
             type_ids: HashMap::new(),
+            storage_data: None,
         };
 
         // -- 3. Initialise output files --
@@ -352,7 +428,51 @@ impl TolkTracer {
                     type_id,
                 }
             }
+            // TON Builder / Cell / Slice surface as `ValueRecord::Raw`
+            // with a human-readable payload summary.  Each of the
+            // three names is registered lazily as `TypeKind::Raw` so
+            // the trace carries a stable `type_id` per shape and the
+            // ct-print decode produces `kind: "Raw"` rows that the
+            // strict test in `tests/test_tracer.rs` asserts on.  We
+            // keep the payload surface minimal (the ordered int list
+            // round-tripped through `storeInt` / `loadInt`) — the
+            // recorder doesn't model the bit-level cell wire format,
+            // but the int round-trip is what `cell_ops_test.tolk`
+            // exercises and the only payload downstream tools render
+            // today.
+            Value::Builder { payload } => {
+                let type_id = self.ensure_raw_type_id("TolkBuilder");
+                ValueRecord::Raw {
+                    r: format_payload("Builder", payload),
+                    type_id,
+                }
+            }
+            Value::Cell { payload } => {
+                let type_id = self.ensure_raw_type_id("TolkCell");
+                ValueRecord::Raw {
+                    r: format_payload("Cell", payload),
+                    type_id,
+                }
+            }
+            Value::Slice { payload, pos } => {
+                let type_id = self.ensure_raw_type_id("TolkSlice");
+                let mut text = format_payload("Slice", payload);
+                text.push_str(&format!(" @{pos}"));
+                ValueRecord::Raw { r: text, type_id }
+            }
         }
+    }
+
+    /// Lazily register a `TypeKind::Raw` type for the given Tolk-
+    /// specific opaque name (`TolkBuilder`, `TolkCell`, `TolkSlice`)
+    /// and return the registered TypeId.
+    fn ensure_raw_type_id(&mut self, name: &str) -> TypeId {
+        if let Some(id) = self.type_ids.get(name).copied() {
+            return id;
+        }
+        let id = TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::Raw, name);
+        self.type_ids.insert(name.to_string(), id);
+        id
     }
 
     /// Evaluate a single function, emitting trace events.
@@ -404,111 +524,24 @@ impl TolkTracer {
 
         // Local variable environment for this function.
         let mut env: HashMap<String, Value> = HashMap::new();
-        let mut return_value: Option<Value> = None;
         // Symbolic stack tracker: mirrors TVM execution to reconstruct
-        // source-level variable names from stack positions.
+        // source-level variable names from stack positions.  Currently
+        // only consulted by the int-arithmetic path — control-flow
+        // arms don't update it because the historical bookkeeping was
+        // only meaningful for the linear var-binding stream.
         let mut sym_stack = StackTracker::new();
 
-        for stmt in &func.body {
-            match stmt {
-                Statement::VarBinding {
-                    name,
-                    type_name,
-                    expr,
-                    line,
-                } => {
-                    // Emit Step event.
-                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
-
-                    // Try the structured-value path first — this captures
-                    // tuple / struct literals and field accesses (`p.x`,
-                    // `pair.0`).  Falls back to the historical i64-only
-                    // TVM path inside `eval_expr_to_value` for pure
-                    // arithmetic.  Per `policies/recorder-test-requirements.md`
-                    // §1, every value flowing through a step event MUST
-                    // surface as the matching `ValueRecord` variant; so
-                    // we detect Tuple/Struct shapes BEFORE projecting to
-                    // i64 (which would silently downgrade them to
-                    // "missing identifier" the moment they hit
-                    // `tvm_eval_expr_checked`).
-                    if let Some(val) =
-                        self.eval_expr_to_value(expr, &env, source_path, func_map)?
-                    {
-                        // For pure-Int values, keep the legacy
-                        // stack-tracker bookkeeping (so derived
-                        // variable-name decoration continues to work
-                        // for arithmetic-only fixtures).
-                        if let Some(int_val) = val.as_i64() {
-                            let int_env = value_env_to_i64_map(&env);
-                            let expr_tracker =
-                                stack_tracker::track_expr(expr, &int_env, int_val);
-                            let _derived = expr_tracker.variables_at_step();
-                            sym_stack.push(int_val, Some(name.clone()));
-                        }
-
-                        // Emit Value event using the source-level
-                        // variable name and the structured value
-                        // record (Int / Tuple / Struct).  For
-                        // declared-type Ints we honour the
-                        // `type_name`-keyed lookup so `bool` etc. keep
-                        // their narrower TypeId; for structured values
-                        // `value_to_record` picks the right id.
-                        let value = match &val {
-                            Value::Int(i) => {
-                                let type_id = self
-                                    .type_ids
-                                    .get(type_name)
-                                    .copied()
-                                    .unwrap_or_else(|| {
-                                        self.type_ids.get("int").copied().unwrap()
-                                    });
-                                ValueRecord::Int { i: *i, type_id }
-                            }
-                            _ => self.value_to_record(&val),
-                        };
-                        env.insert(name.clone(), val);
-                        TraceWriter::register_variable_with_full_value(
-                            &mut *self.writer,
-                            name,
-                            value,
-                        );
-                    }
-                }
-                Statement::Return { expr, line } => {
-                    // Emit Step event for the return line.
-                    TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
-
-                    // Evaluate the return expression via the structured
-                    // resolver (handles literals, field access, calls
-                    // returning structured values, and falls back to
-                    // the int-only TVM pipeline for pure arithmetic).
-                    if let Some(val) =
-                        self.eval_expr_to_value(expr, &env, source_path, func_map)?
-                    {
-                        return_value = Some(val);
-                    }
-                }
-                Statement::Throw { .. } | Statement::Assert { .. } => {
-                    // `throw <code>` / `assert (<cond>, <code>)` are
-                    // currently surfaced as `EventLogKind::Error`
-                    // io_events via the post-execution static sweep
-                    // in `emit_error_events_for_program` so the event
-                    // count is independent of which functions the
-                    // recorder happens to follow from `main()`
-                    // (today only the direct call chain — a separate
-                    // recorder bug pinned by
-                    // `test_error_paths_test_via_ct_print_full`).
-                    // When we later wire execution of every reachable
-                    // throw/assert, these arms should emit the event
-                    // inline (paired with a step at the source line)
-                    // and the sweep should dedupe.  Until then,
-                    // breaking here keeps a runtime throw/assert
-                    // from continuing to evaluate dead code after
-                    // the failure.
-                    break;
-                }
-            }
-        }
+        let exit = self.execute_block(
+            source_path,
+            &func.body,
+            func_map,
+            &mut env,
+            &mut sym_stack,
+        )?;
+        let return_value = match exit {
+            BlockExit::Returned(v) => v,
+            _ => None,
+        };
 
         // Emit Return event (skip for entry point — its steps live under
         // <toplevel> which is closed separately).
@@ -541,7 +574,7 @@ impl TolkTracer {
     fn eval_expr(
         &mut self,
         expr: &str,
-        env: &HashMap<String, Value>,
+        env: &mut HashMap<String, Value>,
         source_path: &Path,
         func_map: &HashMap<String, &FunctionDef>,
     ) -> Result<Option<i64>> {
@@ -626,13 +659,23 @@ impl TolkTracer {
     fn eval_expr_to_value(
         &mut self,
         expr: &str,
-        env: &HashMap<String, Value>,
+        env: &mut HashMap<String, Value>,
         source_path: &Path,
         func_map: &HashMap<String, &FunctionDef>,
     ) -> Result<Option<Value>> {
         let expr = expr.trim();
         if expr.is_empty() {
             return Ok(None);
+        }
+
+        // 0. Method-chain calls (`<lhs>.<method>(<args>)`) and TON
+        // global helpers (`beginCell()`, `set_data(...)`,
+        // `get_data()`).  These must be intercepted BEFORE the struct-
+        // literal / tuple-literal / field-access arms because they
+        // share syntax (a top-level `.` for method chains, parenthesised
+        // arg lists, etc.) and would otherwise be misclassified.
+        if let Some(v) = self.try_eval_ton_call(expr, env, source_path, func_map)? {
+            return Ok(Some(v));
         }
 
         // 1. Struct literal: `Type { f: v, g: w }`.
@@ -721,6 +764,444 @@ impl TolkTracer {
         // `i64` (if any) back into a `Value::Int`.
         let result = self.eval_expr(expr, env, source_path, func_map)?;
         Ok(result.map(Value::Int))
+    }
+
+    /// Execute a sequence of statements (function body, if-arm, loop
+    /// body, ...) in order.  Returns a `BlockExit` that tells the
+    /// caller whether the block fell through, hit a `return`, or
+    /// hit a `throw`/`assert` (which short-circuits enclosing loops
+    /// and branches as well).
+    fn execute_block(
+        &mut self,
+        source_path: &Path,
+        stmts: &[Statement],
+        func_map: &HashMap<String, &FunctionDef>,
+        env: &mut HashMap<String, Value>,
+        sym_stack: &mut StackTracker,
+    ) -> Result<BlockExit> {
+        for stmt in stmts {
+            match self.execute_statement(source_path, stmt, func_map, env, sym_stack)? {
+                BlockExit::Fallthrough => continue,
+                other => return Ok(other),
+            }
+        }
+        Ok(BlockExit::Fallthrough)
+    }
+
+    /// Execute a single statement.  See `execute_block` for the
+    /// `BlockExit` semantics.
+    fn execute_statement(
+        &mut self,
+        source_path: &Path,
+        stmt: &Statement,
+        func_map: &HashMap<String, &FunctionDef>,
+        env: &mut HashMap<String, Value>,
+        sym_stack: &mut StackTracker,
+    ) -> Result<BlockExit> {
+        match stmt {
+            Statement::VarBinding {
+                name,
+                type_name,
+                expr,
+                line,
+            } => {
+                // Emit Step event.
+                TraceWriter::register_step(
+                    &mut *self.writer,
+                    source_path,
+                    Line(*line as i64),
+                );
+
+                if let Some(val) =
+                    self.eval_expr_to_value(expr, env, source_path, func_map)?
+                {
+                    if let Some(int_val) = val.as_i64() {
+                        let int_env = value_env_to_i64_map(env);
+                        let expr_tracker =
+                            stack_tracker::track_expr(expr, &int_env, int_val);
+                        let _derived = expr_tracker.variables_at_step();
+                        sym_stack.push(int_val, Some(name.clone()));
+                    }
+
+                    let value = match &val {
+                        Value::Int(i) => {
+                            let type_id = type_name
+                                .as_deref()
+                                .and_then(|n| self.type_ids.get(n).copied())
+                                .unwrap_or_else(|| {
+                                    self.type_ids.get("int").copied().unwrap()
+                                });
+                            ValueRecord::Int { i: *i, type_id }
+                        }
+                        _ => self.value_to_record(&val),
+                    };
+                    env.insert(name.clone(), val);
+                    TraceWriter::register_variable_with_full_value(
+                        &mut *self.writer,
+                        name,
+                        value,
+                    );
+                }
+                Ok(BlockExit::Fallthrough)
+            }
+            Statement::Assign { name, expr, line } => {
+                // Emit Step event for the assignment line.
+                TraceWriter::register_step(
+                    &mut *self.writer,
+                    source_path,
+                    Line(*line as i64),
+                );
+
+                if let Some(val) =
+                    self.eval_expr_to_value(expr, env, source_path, func_map)?
+                {
+                    let value = self.value_to_record(&val);
+                    env.insert(name.clone(), val);
+                    TraceWriter::register_variable_with_full_value(
+                        &mut *self.writer,
+                        name,
+                        value,
+                    );
+                }
+                Ok(BlockExit::Fallthrough)
+            }
+            Statement::Return { expr, line } => {
+                TraceWriter::register_step(
+                    &mut *self.writer,
+                    source_path,
+                    Line(*line as i64),
+                );
+
+                let val = self.eval_expr_to_value(expr, env, source_path, func_map)?;
+                Ok(BlockExit::Returned(val))
+            }
+            Statement::Throw { .. } | Statement::Assert { .. } => {
+                // See the original-arm comment: today these are
+                // surfaced as Error io_events via the post-execution
+                // static sweep.  We propagate `Aborted` so enclosing
+                // loops / branches stop executing instead of running
+                // dead code past the failure marker.
+                Ok(BlockExit::Aborted)
+            }
+            Statement::If {
+                cond,
+                then_block,
+                else_block,
+                line,
+            } => {
+                // Emit a Step event for the if-header line so the
+                // branch shows up in the calltrace pane.
+                TraceWriter::register_step(
+                    &mut *self.writer,
+                    source_path,
+                    Line(*line as i64),
+                );
+                let cond_val = self.eval_cond(cond, env, source_path, func_map)?;
+                let arm = if cond_val { then_block } else { else_block };
+                self.execute_block(source_path, arm, func_map, env, sym_stack)
+            }
+            Statement::While { cond, body, line } => {
+                // Emit a Step event for the loop header so the loop
+                // construct itself shows up in the trace.
+                TraceWriter::register_step(
+                    &mut *self.writer,
+                    source_path,
+                    Line(*line as i64),
+                );
+                let mut iters = 0u32;
+                loop {
+                    if iters >= LOOP_ITERATION_BOUND {
+                        eprintln!(
+                            "while loop at line {line} exceeded {LOOP_ITERATION_BOUND} \
+                             iterations; aborting recorder-side evaluation"
+                        );
+                        break;
+                    }
+                    if !self.eval_cond(cond, env, source_path, func_map)? {
+                        break;
+                    }
+                    match self.execute_block(source_path, body, func_map, env, sym_stack)? {
+                        BlockExit::Fallthrough => {}
+                        other => return Ok(other),
+                    }
+                    iters += 1;
+                }
+                Ok(BlockExit::Fallthrough)
+            }
+            Statement::Repeat {
+                count_expr,
+                body,
+                line,
+            } => {
+                TraceWriter::register_step(
+                    &mut *self.writer,
+                    source_path,
+                    Line(*line as i64),
+                );
+                let count = self
+                    .eval_expr_to_value(count_expr, env, source_path, func_map)?
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let count = count.max(0) as u64;
+                let bound = LOOP_ITERATION_BOUND as u64;
+                let actual = count.min(bound);
+                if count > bound {
+                    eprintln!(
+                        "repeat loop at line {line} requested {count} iterations; \
+                         clamping to recorder-side bound {bound}"
+                    );
+                }
+                for _ in 0..actual {
+                    match self.execute_block(source_path, body, func_map, env, sym_stack)? {
+                        BlockExit::Fallthrough => {}
+                        other => return Ok(other),
+                    }
+                }
+                Ok(BlockExit::Fallthrough)
+            }
+            Statement::DoUntil { body, cond, line } => {
+                TraceWriter::register_step(
+                    &mut *self.writer,
+                    source_path,
+                    Line(*line as i64),
+                );
+                let mut iters = 0u32;
+                loop {
+                    if iters >= LOOP_ITERATION_BOUND {
+                        eprintln!(
+                            "do/until loop at line {line} exceeded \
+                             {LOOP_ITERATION_BOUND} iterations; aborting \
+                             recorder-side evaluation"
+                        );
+                        break;
+                    }
+                    match self.execute_block(source_path, body, func_map, env, sym_stack)? {
+                        BlockExit::Fallthrough => {}
+                        other => return Ok(other),
+                    }
+                    iters += 1;
+                    if self.eval_cond(cond, env, source_path, func_map)? {
+                        break;
+                    }
+                }
+                Ok(BlockExit::Fallthrough)
+            }
+            Statement::ExprStatement { expr, line } => {
+                // Emit a Step event for the call line and run the
+                // expression for its side effects (`set_data(c);`,
+                // method-chain mutations on a builder, etc.).  The
+                // returned value is intentionally discarded.
+                TraceWriter::register_step(
+                    &mut *self.writer,
+                    source_path,
+                    Line(*line as i64),
+                );
+                let _ = self.eval_expr_to_value(expr, env, source_path, func_map)?;
+                Ok(BlockExit::Fallthrough)
+            }
+        }
+    }
+
+    /// Evaluate a condition expression to a Rust `bool`.  Anything
+    /// non-zero (including the TVM convention `-1` for "true" and the
+    /// recorder's normalised `1`) counts as truthy; missing /
+    /// unparseable conditions default to `false` so loops terminate
+    /// rather than spin forever.
+    fn eval_cond(
+        &mut self,
+        cond: &str,
+        env: &mut HashMap<String, Value>,
+        source_path: &Path,
+        func_map: &HashMap<String, &FunctionDef>,
+    ) -> Result<bool> {
+        let val = self.eval_expr_to_value(cond, env, source_path, func_map)?;
+        Ok(val.and_then(|v| v.as_i64()).unwrap_or(0) != 0)
+    }
+
+    /// Recognise and evaluate the small set of TON-specific calls used
+    /// by `cell_ops_test.tolk` — global helpers (`beginCell()`,
+    /// `set_data(<expr>)`, `get_data()`) and Builder/Slice/Cell method
+    /// chains (`<lhs>.storeInt(<v>, <bits>)`, `<lhs>.endCell()`,
+    /// `<lhs>.beginParse()`, `<lhs>.loadInt(<bits>)`).  Returns
+    /// `Ok(Some(_))` if the expression matched and was handled,
+    /// `Ok(None)` otherwise so the caller falls through to the rest
+    /// of the resolver chain.
+    ///
+    /// `set_data(c)` and `get_data()` register an io_event each
+    /// (`EventLogKind::Write` / `EventLogKind::Read`, metadata
+    /// `"TolkStorage"`) so the canonical-CTFS trace surfaces TON
+    /// persistent-storage interactions on the same channel as the
+    /// rest of the recorder ecosystem.
+    fn try_eval_ton_call(
+        &mut self,
+        expr: &str,
+        env: &mut HashMap<String, Value>,
+        source_path: &Path,
+        func_map: &HashMap<String, &FunctionDef>,
+    ) -> Result<Option<Value>> {
+        let expr = expr.trim();
+
+        // Global helpers: `beginCell()`, `get_data()`, `set_data(<expr>)`.
+        if let Some((name, args)) = parse_call_with_args(expr) {
+            if name == "beginCell" && args.is_empty() {
+                return Ok(Some(Value::Builder { payload: Vec::new() }));
+            }
+            if name == "get_data" && args.is_empty() {
+                let payload = match &self.storage_data {
+                    Some(Value::Cell { payload }) => payload.clone(),
+                    Some(Value::Builder { payload }) => payload.clone(),
+                    _ => Vec::new(),
+                };
+                let summary = format_payload("Cell", &payload);
+                TraceWriter::register_special_event(
+                    &mut *self.writer,
+                    EventLogKind::Read,
+                    "TolkStorage",
+                    &format!("get_data: {summary}"),
+                );
+                return Ok(Some(Value::Cell { payload }));
+            }
+            if name == "set_data" && args.len() == 1 {
+                if let Some(val) =
+                    self.eval_expr_to_value(&args[0], env, source_path, func_map)?
+                {
+                    let summary = match &val {
+                        Value::Cell { payload } => format_payload("Cell", payload),
+                        Value::Builder { payload } => format_payload("Builder", payload),
+                        _ => "<non-cell>".to_string(),
+                    };
+                    TraceWriter::register_special_event(
+                        &mut *self.writer,
+                        EventLogKind::Write,
+                        "TolkStorage",
+                        &format!("set_data: {summary}"),
+                    );
+                    self.storage_data = Some(val);
+                }
+                // `set_data(c);` is statement-shaped; we still return
+                // something concrete so the surrounding expression
+                // doesn't accidentally fall through to the int-only
+                // TVM path.  An empty `Cell` is harmless because the
+                // call doesn't show up on a value-bearing RHS.
+                return Ok(Some(Value::Cell { payload: Vec::new() }));
+            }
+        }
+
+        // Method chains: `<lhs>.<method>(<args>)`.  Use the rightmost
+        // top-level dot as the split point so chained calls
+        // (`beginCell().storeInt(42, 32).endCell()`) recurse left-
+        // first.
+        if let Some((lhs_str, method, arg_strs)) = parse_method_call(expr) {
+            // Evaluate the LHS first.  This may itself emit io_events
+            // (e.g. `get_data()` chained with `.beginParse()`).
+            let base = match self.eval_expr_to_value(lhs_str, env, source_path, func_map)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            // Evaluate the args eagerly — every cell-op argument we
+            // care about is an int.
+            let mut arg_vals = Vec::with_capacity(arg_strs.len());
+            for a in &arg_strs {
+                let v = self
+                    .eval_expr_to_value(a, env, source_path, func_map)?
+                    .and_then(|v| v.as_i64());
+                arg_vals.push(v);
+            }
+
+            match method {
+                "storeInt" | "storeUint" | "storeRef" => {
+                    let mut payload = match base {
+                        Value::Builder { payload } => payload,
+                        Value::Cell { payload } => payload,
+                        _ => return Ok(None),
+                    };
+                    if let Some(Some(v)) = arg_vals.first() {
+                        payload.push(*v);
+                    }
+                    return Ok(Some(Value::Builder { payload }));
+                }
+                "endCell" => {
+                    let payload = match base {
+                        Value::Builder { payload } => payload,
+                        Value::Cell { payload } => payload,
+                        _ => return Ok(None),
+                    };
+                    return Ok(Some(Value::Cell { payload }));
+                }
+                "beginParse" => {
+                    let payload = match base {
+                        Value::Cell { payload } => payload,
+                        Value::Builder { payload } => payload,
+                        Value::Slice { payload, .. } => payload,
+                        _ => return Ok(None),
+                    };
+                    return Ok(Some(Value::Slice { payload, pos: 0 }));
+                }
+                "loadInt" | "loadUint" => {
+                    let (payload, pos) = match base {
+                        Value::Slice { payload, pos } => (payload, pos),
+                        _ => return Ok(None),
+                    };
+                    let value = payload.get(pos).copied().unwrap_or(0);
+                    let new_slice = Value::Slice {
+                        payload,
+                        pos: pos + 1,
+                    };
+                    // If the LHS was a simple identifier, mutate the
+                    // env so subsequent `loadInt` calls advance the
+                    // cursor.  Anything more complex (chained calls,
+                    // expressions) just yields the int — the caller
+                    // can't observe the slice anyway.
+                    let lhs_ident = lhs_str.trim();
+                    if is_simple_identifier(lhs_ident) {
+                        env.insert(lhs_ident.to_string(), new_slice);
+                    }
+                    return Ok(Some(Value::Int(value)));
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+/// Outcome of executing a block of statements.  Encodes whether the
+/// block ran to completion, hit a `return`, or aborted (via
+/// `throw`/`assert`).  Bubbles out of nested loops / branches so a
+/// `return` inside a `while` body terminates the enclosing function
+/// rather than just the loop iteration.
+#[derive(Debug)]
+enum BlockExit {
+    /// Block ran every statement to completion; caller continues with
+    /// the next statement at the same nesting level.
+    Fallthrough,
+    /// Block hit a `return <expr>;`.  `Some(v)` if the return carried
+    /// a value, `None` for `return;` or evaluation failures.
+    Returned(Option<Value>),
+    /// Block hit a `throw`/`assert` (or a nested block did).  Caller
+    /// should stop evaluating further statements at every enclosing
+    /// level — there's no "catch" arm in the current AST.
+    Aborted,
+}
+
+/// Maximum number of iterations the recorder-side interpreter will
+/// run a `while` / `repeat` / `do/until` loop for before giving up.
+/// Acts as a safety net against runaway loops in case the condition
+/// expression doesn't evaluate the way the program author intended.
+/// Picked at 10_000 to comfortably cover the small fixtures in
+/// `test-programs/tolk/` while still keeping the recorder bounded.
+const LOOP_ITERATION_BOUND: u32 = 10_000;
+
+/// Format a Builder/Cell/Slice payload as a human-readable string for
+/// the on-trace `ValueRecord::Raw.r` field.  The payload is the ordered
+/// int list round-tripped through `storeInt` / `loadInt`.
+fn format_payload(kind: &'static str, payload: &[i64]) -> String {
+    if payload.is_empty() {
+        format!("{kind}([])")
+    } else {
+        let parts: Vec<String> = payload.iter().map(|v| v.to_string()).collect();
+        format!("{kind}([{}])", parts.join(", "))
     }
 }
 
@@ -811,6 +1292,8 @@ fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
 /// Parse function definitions from Tolk source code.
 ///
 /// Handles the pattern: `fun <name>(<params>): <type> { ... }`
+/// and recursively parses control-flow blocks (`if`, `else`, `while`,
+/// `repeat`, `do`/`until`) inside each body.
 fn parse_functions(source: &str) -> Vec<FunctionDef> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
@@ -863,50 +1346,11 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
             None
         };
 
-        // Parse body: collect statements between { and }.
-        let mut body = Vec::new();
-        let mut brace_depth = 0i32;
-        let mut body_started = false;
-
-        // Count opening braces on the definition line.
-        for ch in lines[i].chars() {
-            match ch {
-                '{' => {
-                    brace_depth += 1;
-                    body_started = true;
-                }
-                '}' => brace_depth -= 1,
-                _ => {}
-            }
-        }
-
-        let mut j = i + 1;
-        while j < lines.len() && (brace_depth > 0 || !body_started) {
-            let body_line = lines[j].trim();
-            let body_line_num = (j + 1) as u32;
-
-            // Track brace depth.
-            for ch in lines[j].chars() {
-                match ch {
-                    '{' => {
-                        brace_depth += 1;
-                        body_started = true;
-                    }
-                    '}' => brace_depth -= 1,
-                    _ => {}
-                }
-            }
-
-            // Parse statements.
-            if let Some(stmt) = parse_statement(body_line, body_line_num) {
-                body.push(stmt);
-            }
-
-            if brace_depth <= 0 && body_started {
-                break;
-            }
-            j += 1;
-        }
+        // The function definition line carries the opening `{`; the
+        // recursive block parser starts on the next source line and
+        // returns the index of the matching `}`.
+        let body_start = i + 1;
+        let (body, body_end) = parse_block(&lines, body_start);
 
         if !name.is_empty() {
             functions.push(FunctionDef {
@@ -918,10 +1362,260 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
             });
         }
 
-        i = j + 1;
+        i = body_end + 1;
     }
 
     functions
+}
+
+/// Parse a `{ ... }` block of statements starting at `start` (the
+/// first line *inside* the block).  Returns the parsed statements plus
+/// the line index of the closing `}` (so the caller can resume from
+/// `closing + 1`).
+///
+/// Recognises the following block-introducing constructs:
+///   * `if (cond) { ... }` plus chained `else if (cond) { ... }` and
+///     `else { ... }`.
+///   * `while (cond) { ... }`.
+///   * `repeat (count) { ... }`.
+///   * `do { ... } until (cond);`.
+///
+/// Other lines inside the block are handed to `parse_statement` so
+/// `var` / `val` / `return` / `throw` / `assert` / bare assignment /
+/// `<call>(...)` expression statements all surface.
+fn parse_block(lines: &[&str], start: usize) -> (Vec<Statement>, usize) {
+    let mut body = Vec::new();
+    let mut idx = start;
+    while idx < lines.len() {
+        let raw_line = lines[idx];
+        let trimmed = raw_line.trim();
+        let line_num = (idx + 1) as u32;
+
+        // Any line that starts with `}` closes the current block.
+        // The trailing tokens (e.g. `} else if (cond) {` /
+        // `} else {` / `} until (cond);`) are inspected by the
+        // higher-level handler that originally called us so it can
+        // chain the next block in the same construct.  We do NOT fall
+        // through to statement parsing for these lines — that would
+        // misclassify them as noise expressions.
+        if trimmed.starts_with('}') {
+            return (body, idx);
+        }
+
+        // `if (cond) {` opens a then-block; we then look for chained
+        // `else if (cond) {` / `else {` clauses and fold them into
+        // the same If node.
+        if let Some(cond) = strip_block_header(trimmed, "if") {
+            let (then_block, then_end) = parse_block(lines, idx + 1);
+            // Probe for trailing `else` / `else if` clauses.  The
+            // `}` line may carry a trailing `else if (...)` /
+            // `else {` token (e.g. `} else if (raw == 0) {`); fall
+            // back to the next line for the `else { ... }` form.
+            let (else_block, advance_to) =
+                parse_else_clauses(lines, then_end);
+            body.push(Statement::If {
+                cond,
+                then_block,
+                else_block,
+                line: line_num,
+            });
+            idx = advance_to + 1;
+            continue;
+        }
+
+        if let Some(cond) = strip_block_header(trimmed, "while") {
+            let (loop_body, end) = parse_block(lines, idx + 1);
+            body.push(Statement::While {
+                cond,
+                body: loop_body,
+                line: line_num,
+            });
+            idx = end + 1;
+            continue;
+        }
+
+        if let Some(count_expr) = strip_block_header(trimmed, "repeat") {
+            let (loop_body, end) = parse_block(lines, idx + 1);
+            body.push(Statement::Repeat {
+                count_expr,
+                body: loop_body,
+                line: line_num,
+            });
+            idx = end + 1;
+            continue;
+        }
+
+        // `do {` opens a loop body that ends with `} until (cond);`.
+        // The `}` line itself carries the `until (cond);` suffix that
+        // we need to capture as the loop's condition.
+        if trimmed == "do" || trimmed == "do {" {
+            let (loop_body, end_line) = parse_block(lines, idx + 1);
+            // The closing `}` may have a trailing `until (cond);`.
+            let close_line = lines[end_line].trim();
+            // Strip the leading `}`, then `until`, then the
+            // parenthesised condition.
+            let after_brace = close_line
+                .strip_prefix('}')
+                .unwrap_or(close_line)
+                .trim();
+            let cond = if let Some(rest) = after_brace.strip_prefix("until") {
+                let rest = rest.trim();
+                rest.strip_prefix('(')
+                    .and_then(|r| r.rfind(')').map(|p| &r[..p]))
+                    .map(|c| c.trim().to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            body.push(Statement::DoUntil {
+                body: loop_body,
+                cond,
+                line: line_num,
+            });
+            idx = end_line + 1;
+            continue;
+        }
+
+        // Fall back to statement parsing for non-block lines.
+        if let Some(stmt) = parse_statement(trimmed, line_num) {
+            body.push(stmt);
+        }
+        idx += 1;
+    }
+    (body, idx)
+}
+
+/// Parse zero or more `else` / `else if` clauses that may follow an
+/// `if` block's closing `}`.  Returns the chained `else_block` (which
+/// is either empty, a single-element `Vec` containing another `If`,
+/// or the body of the terminal plain `else { ... }`) plus the line
+/// index where the chain ends (so the caller resumes from
+/// `end + 1`).
+fn parse_else_clauses(lines: &[&str], close_idx: usize) -> (Vec<Statement>, usize) {
+    let close_line = lines[close_idx].trim();
+    // Case 1: `} else if (cond) {` on the same line.
+    if let Some(rest) = close_line.strip_prefix('}') {
+        let rest = rest.trim();
+        if let Some(cond) = rest
+            .strip_prefix("else if")
+            .or_else(|| rest.strip_prefix("else  if"))
+        {
+            // Recover the parenthesised condition.
+            let cond_text = strip_paren_block_header(cond.trim());
+            if let Some(cond) = cond_text {
+                let (then_block, end) = parse_block(lines, close_idx + 1);
+                let line = (close_idx + 1) as u32;
+                let (chained_else, end2) = parse_else_clauses(lines, end);
+                return (
+                    vec![Statement::If {
+                        cond,
+                        then_block,
+                        else_block: chained_else,
+                        line,
+                    }],
+                    end2,
+                );
+            }
+        }
+        if rest == "else {" || rest == "else{" {
+            let (else_block, end) = parse_block(lines, close_idx + 1);
+            return (else_block, end);
+        }
+    }
+    // Case 2: `}` on one line, `else if (...)` / `else {` on the next.
+    if close_idx + 1 < lines.len() {
+        let next = lines[close_idx + 1].trim();
+        if let Some(cond) = next
+            .strip_prefix("else if")
+            .or_else(|| next.strip_prefix("else  if"))
+        {
+            let cond_text = strip_paren_block_header(cond.trim());
+            if let Some(cond) = cond_text {
+                let (then_block, end) = parse_block(lines, close_idx + 2);
+                let line = (close_idx + 2) as u32;
+                let (chained_else, end2) = parse_else_clauses(lines, end);
+                return (
+                    vec![Statement::If {
+                        cond,
+                        then_block,
+                        else_block: chained_else,
+                        line,
+                    }],
+                    end2,
+                );
+            }
+        }
+        if next == "else {" || next == "else{" {
+            let (else_block, end) = parse_block(lines, close_idx + 2);
+            return (else_block, end);
+        }
+    }
+    (Vec::new(), close_idx)
+}
+
+/// Recognise a block-introducing line of the shape
+/// `<keyword> (<expr>) {` and return the parenthesised expression.
+/// Returns `None` if the line doesn't match the shape exactly.
+fn strip_block_header(line: &str, keyword: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix(keyword)?
+        .trim_start();
+    let rest = rest.strip_prefix('(')?;
+    // Find the matching close paren at depth 0; everything after
+    // must be `{` (optionally with whitespace).
+    let mut depth = 1i32;
+    let mut close: Option<usize> = None;
+    let bytes = rest.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let cond = rest[..close].trim().to_string();
+    let after = rest[close + 1..].trim();
+    if after != "{" {
+        return None;
+    }
+    Some(cond)
+}
+
+/// Strip a `(<expr>) {` suffix and return `<expr>`.  Used to recover
+/// the condition of an `else if` clause whose preceding tokens have
+/// already been consumed.
+fn strip_paren_block_header(rest: &str) -> Option<String> {
+    let rest = rest.strip_prefix('(')?;
+    let mut depth = 1i32;
+    let mut close: Option<usize> = None;
+    let bytes = rest.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let cond = rest[..close].trim().to_string();
+    let after = rest[close + 1..].trim();
+    if after != "{" {
+        return None;
+    }
+    Some(cond)
 }
 
 /// Parse a parameter list string like "a: int, b: int" into (name, type) pairs.
@@ -954,28 +1648,49 @@ fn parse_param_list(params_str: &str) -> Vec<(String, String)> {
 fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
     let trimmed = line.trim();
 
-    // var/val binding: `var <name>: <type> = <expr>;` or `val <name>: <type> = <expr>;`
+    // var/val binding.  Two accepted shapes:
+    //   * `var <name>: <type> = <expr>;` / `val <name>: <type> = <expr>;`
+    //   * `var <name> = <expr>;` (typeless — Tolk allows this for
+    //     Cell / Slice / Builder bindings; the recorder defaults the
+    //     declared type to `int` for trace emission so the value still
+    //     round-trips through `register_variable_with_full_value`).
+    //
+    // To distinguish the two we look at whether a `:` precedes the
+    // first top-level `=` sign.  If yes, the type annotation lives
+    // between them; if no, the binding is typeless.
     if let Some(after_keyword) = trimmed
         .strip_prefix("var ")
         .or_else(|| trimmed.strip_prefix("val "))
     {
-        if let Some(colon_pos) = after_keyword.find(':') {
-            let name = after_keyword[..colon_pos].trim().to_string();
-            let after_colon = &after_keyword[colon_pos + 1..];
-            if let Some(eq_pos) = after_colon.find('=') {
-                let type_name = after_colon[..eq_pos].trim().to_string();
-                let expr = after_colon[eq_pos + 1..]
-                    .trim()
-                    .trim_end_matches(';')
-                    .trim()
-                    .to_string();
-                if !name.is_empty() && !type_name.is_empty() && !expr.is_empty() {
-                    return Some(Statement::VarBinding {
-                        name,
-                        type_name,
-                        expr,
-                        line: line_num,
-                    });
+        if let Some(eq_pos) = find_top_level_assign(after_keyword) {
+            let lhs = after_keyword[..eq_pos].trim();
+            let expr = after_keyword[eq_pos + 1..]
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
+            if !expr.is_empty() {
+                if let Some(colon_pos) = lhs.find(':') {
+                    let name = lhs[..colon_pos].trim().to_string();
+                    let type_name = lhs[colon_pos + 1..].trim().to_string();
+                    if !name.is_empty() && !type_name.is_empty() {
+                        return Some(Statement::VarBinding {
+                            name,
+                            type_name: Some(type_name),
+                            expr,
+                            line: line_num,
+                        });
+                    }
+                } else {
+                    let name = lhs.to_string();
+                    if !name.is_empty() && is_simple_identifier(&name) {
+                        return Some(Statement::VarBinding {
+                            name,
+                            type_name: None,
+                            expr,
+                            line: line_num,
+                        });
+                    }
                 }
             }
         }
@@ -1000,6 +1715,29 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         if !code.is_empty() {
             return Some(Statement::Throw {
                 code,
+                line: line_num,
+            });
+        }
+    }
+
+    // bare assignment: `<name> = <expr>;`.  The LHS must be a simple
+    // identifier (loop counters, accumulators, branch-arm sinks); we
+    // do not support qualified or indexed targets here because the
+    // env is a flat `HashMap<String, Value>`.  Compound operators
+    // (`+=`, `-=`, …) are normalised to plain `=` by their respective
+    // parse arms; a bare `=` line with an identifier LHS is the only
+    // shape recognised here.
+    if let Some(eq_pos) = find_top_level_assign(trimmed) {
+        let lhs = trimmed[..eq_pos].trim();
+        let rhs = trimmed[eq_pos + 1..]
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if is_simple_identifier(lhs) && !rhs.is_empty() {
+            return Some(Statement::Assign {
+                name: lhs.to_string(),
+                expr: rhs,
                 line: line_num,
             });
         }
@@ -1037,6 +1775,56 @@ fn parse_statement(line: &str, line_num: u32) -> Option<Statement> {
         }
     }
 
+    // Expression statement: a bare `<call>(...);` line invoked for
+    // its side effect.  Used by `set_data(c);` and similar storage-
+    // mutation calls.  We only register lines whose stripped form
+    // looks like a function call (ends with `)` after stripping the
+    // trailing semicolon) so we don't accidentally swallow noise.
+    let body = trimmed.trim_end_matches(';').trim();
+    if body.ends_with(')') && body.contains('(') && !body.starts_with('{') {
+        return Some(Statement::ExprStatement {
+            expr: body.to_string(),
+            line: line_num,
+        });
+    }
+
+    None
+}
+
+/// Find the position of the first top-level `=` sign that is NOT part
+/// of a comparison / equality / inequality operator (`==`, `!=`,
+/// `<=`, `>=`).  Returns `None` if no such sign exists.
+fn find_top_level_assign(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
+                // Skip `==`.
+                let next = bytes.get(i + 1).copied();
+                if next == Some(b'=') {
+                    i += 2;
+                    continue;
+                }
+                // Skip `!=`, `<=`, `>=`.
+                let prev = if i == 0 { None } else { Some(bytes[i - 1]) };
+                if prev == Some(b'!')
+                    || prev == Some(b'<')
+                    || prev == Some(b'>')
+                    || prev == Some(b'=')
+                {
+                    i += 1;
+                    continue;
+                }
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
     None
 }
 
@@ -1051,6 +1839,130 @@ fn parse_function_call(expr: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Parse a top-level call shape `<ident>(<args>)` into the function
+/// name plus a `Vec<String>` of trimmed argument expressions.  Returns
+/// `None` for non-call expressions, or when the identifier portion
+/// contains anything other than the usual `[A-Za-z_][A-Za-z0-9_]*`
+/// alphabet (so we don't accidentally match `a + b()` as a call to
+/// `a + b`).
+fn parse_call_with_args(expr: &str) -> Option<(&str, Vec<String>)> {
+    let expr = expr.trim();
+    if !expr.ends_with(')') {
+        return None;
+    }
+    // Find the position of the matching `(` by walking from the right
+    // and counting parens.  The first `(` we encounter at depth 1 (we
+    // start at depth 0 for the trailing `)`) is the splitter.
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut open_pos: Option<usize> = None;
+    for i in (0..bytes.len()).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open_pos?;
+    let name = expr[..open].trim();
+    if name.is_empty() {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_')
+        || !name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+    {
+        return None;
+    }
+    let inner = &expr[open + 1..expr.len() - 1];
+    let args = if inner.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_top_level_commas(inner)
+    };
+    Some((name, args))
+}
+
+/// Parse a method-call shape `<lhs>.<method>(<args>)` into
+/// `(<lhs-expr>, <method-name>, <arg-strings>)`.  The split point is
+/// the rightmost top-level dot that precedes a `<method>(<args>)`
+/// call segment, so chained calls like `beginCell().storeInt(42, 32)
+/// .endCell()` parse as `(beginCell().storeInt(42, 32), endCell, [])`
+/// and the LHS recurses through the same resolver.
+fn parse_method_call(expr: &str) -> Option<(&str, &str, Vec<String>)> {
+    let expr = expr.trim();
+    if !expr.ends_with(')') {
+        return None;
+    }
+    // Find the matching open paren (the one that pairs with the final `)`).
+    let bytes = expr.as_bytes();
+    let mut depth = 0i32;
+    let mut open_pos: Option<usize> = None;
+    for i in (0..bytes.len()).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open_pos?;
+    // The character immediately before the `(` must end a method
+    // identifier; we then walk left to the dot.
+    let pre_call = expr[..open].trim_end();
+    let dot_pos = pre_call.rfind('.')?;
+    let method = pre_call[dot_pos + 1..].trim();
+    if method.is_empty()
+        || !method.chars().all(|c| c.is_alphanumeric() || c == '_')
+        || !method
+            .chars()
+            .next()
+            .map(|c| c.is_alphabetic() || c == '_')
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    // The dot we found must be at top level (depth 0) in the original
+    // expression — otherwise we'd be slicing in the middle of a
+    // parenthesised arg.
+    let dot_abs = dot_pos;
+    let prefix_bytes = &expr.as_bytes()[..dot_abs];
+    let mut d = 0i32;
+    for &b in prefix_bytes {
+        match b {
+            b'(' | b'[' | b'{' => d += 1,
+            b')' | b']' | b'}' => d -= 1,
+            _ => {}
+        }
+    }
+    if d != 0 {
+        return None;
+    }
+    let lhs = expr[..dot_abs].trim();
+    if lhs.is_empty() {
+        return None;
+    }
+    let inner = &expr[open + 1..expr.len() - 1];
+    let args = if inner.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_top_level_commas(inner)
+    };
+    Some((lhs, method, args))
 }
 
 /// Split a string on top-level commas (commas at depth 0 across all
@@ -1247,7 +2159,7 @@ fun main(): int {
                 line,
             } => {
                 assert_eq!(name, "a");
-                assert_eq!(type_name, "int");
+                assert_eq!(type_name, Some("int".to_string()));
                 assert_eq!(expr, "10");
                 assert_eq!(line, 3);
             }
@@ -1267,7 +2179,7 @@ fun main(): int {
                 line,
             } => {
                 assert_eq!(name, "x");
-                assert_eq!(type_name, "bool");
+                assert_eq!(type_name, Some("bool".to_string()));
                 assert_eq!(expr, "true");
                 assert_eq!(line, 5);
             }

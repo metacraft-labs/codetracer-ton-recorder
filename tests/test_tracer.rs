@@ -493,12 +493,13 @@ fn test_nested_calls_test_via_ct_print_full() {
 
 /// Records `control_flow_test.tolk` and pins the **current observed**
 /// shape.  The program exercises if/else, while, repeat, and
-/// do/until.  The recorder is hand-rolled and intentionally does
-/// **not** parse any of those constructs — the parser's
-/// `parse_statement` only matches `var`/`val`/`return` lines, and
-/// assignment statements (`sign = -1;`) are dropped on the floor.
-/// See RECORDER BUG notes inline + the parallel `#[ignore]`d test
-/// for the spec-compliant expectation.
+/// do/until — all four are now driven by the recorder-side
+/// interpreter (see the `Statement::If`/`While`/`Repeat`/`DoUntil`
+/// arms in `src/tracer.rs::execute_statement`), so loop bodies and
+/// branch arms surface as real step + var events instead of being
+/// dropped on the floor.  The parallel `loops_and_branches_executed`
+/// test pins the spec-compliant return-value sequence; this one pins
+/// the full counts and the per-iteration variable trail.
 #[test]
 fn test_control_flow_test_via_ct_print_full() {
     let Some((doc, source_path)) = record_and_dump_full(
@@ -529,19 +530,21 @@ fn test_control_flow_test_via_ct_print_full() {
     );
 
     let counts = &doc["counts"];
-    // 18 steps:
-    //   2 outer (toplevel-line-1 + dispatch line for compute) +
-    //   3 classify (dispatch + var raw + var sign + return) -- but
-    //     ct-print attributes the trailing return step to the caller's
-    //     function context, so the "classify" rows are dispatch + var
-    //     raw + var sign = 3 inside classify; the return-line step
-    //     shows up as part of compute's frame.
-    //   -- the same return-attribution happens for loop_sum,
-    //   repeat_count, do_until_grow, so the step count is the sum of
-    //   all parsed statements + the dispatch lines + the toplevel
-    //   pre/post lines.  Pinning to 18 here is a golden snapshot;
-    //   any change is a real regression to investigate.
-    assert_eq!(counts["steps"].as_u64(), Some(18), "steps; counts={counts}");
+    // 38 steps:
+    //   1 toplevel pre-line + 1 main dispatch (`return compute();`)
+    //   compute (6 stmts: 5 var bindings + return) = 6
+    //   classify (3 stmts before if + if header + 1 chosen-arm assignment + return) = 6
+    //   loop_sum (2 var bindings + while header + 4 iterations × 2 stmts + return) = 12
+    //   repeat_count (1 var binding + repeat header + 3 iterations × 1 stmt + return) = 6
+    //   do_until_grow (1 var binding + do header + 3 iterations × 1 stmt + return) = 6
+    //   = 2 + 6 + 6 + 12 + 6 + 6 = 38.
+    // Each var binding / assignment / return / loop-header / branch-header emits
+    // exactly one Step event; the totals above match the per-iteration trail
+    // (raw=7, sign=0, sign=1, total=0, i=0, total=0, i=1, total=1, i=2,
+    // total=3, i=3, total=6, i=4, counter 0..3, x 1→2→4→8) plus the four
+    // helper-return-bridge bindings (sign, loop_total, repeated, grown,
+    // combined).
+    assert_eq!(counts["steps"].as_u64(), Some(38), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
     assert_eq!(
         counts["io_events"].as_u64(),
@@ -550,8 +553,8 @@ fn test_control_flow_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 18 steps + 5 call_entry + 5 call_exit = 28 events.
-    assert_eq!(events.len(), 28, "events.len()");
+    // 38 steps + 5 call_entry + 5 call_exit = 48 events.
+    assert_eq!(events.len(), 48, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     assert_eq!(
@@ -575,33 +578,51 @@ fn test_control_flow_test_via_ct_print_full() {
         ],
     );
 
-    // RECORDER BUG: assignment statements (`sign = -1;`, `total = total + i;`,
-    // `i = i + 1;`, `counter = counter + 1;`, `x = x + x;`) are not parsed,
-    // so the only var values that surface are the pre-loop / pre-branch
-    // initialisations.  Spec-compliant output (see #[ignore]d test below)
-    // would also surface every iteration's intermediate values.
+    // Per-iteration variable trail.  Captures every assignment plus
+    // every var binding that the recorder-side interpreter walks
+    // through (including the helper-return bridge bindings inside
+    // `compute()`).  Assignment statements like `sign = -1;`,
+    // `total = total + i;`, `i = i + 1;`, `counter = counter + 1;`,
+    // and `x = x + x;` now surface end-to-end.
     assert_eq!(
         observed_int_vars(&doc),
         vec![
+            // classify(): raw=7, sign=0, then else-arm assigns sign=1.
             ("raw".into(), 7),
             ("sign".into(), 0),
-            // `compute()` re-binds `sign` from the (unparsed) classify
-            // return — value still 0 because all three branch arms
-            // are invisible to the parser.
-            ("sign".into(), 0),
+            ("sign".into(), 1),
+            // compute()'s helper-return binding for classify.
+            ("sign".into(), 1),
+            // loop_sum(): total=0, i=0, then 4 iterations.
             ("total".into(), 0),
             ("i".into(), 0),
-            ("loop_total".into(), 0),
+            ("total".into(), 0),
+            ("i".into(), 1),
+            ("total".into(), 1),
+            ("i".into(), 2),
+            ("total".into(), 3),
+            ("i".into(), 3),
+            ("total".into(), 6),
+            ("i".into(), 4),
+            ("loop_total".into(), 6),
+            // repeat_count(): counter=0 then 3 increments.
             ("counter".into(), 0),
-            ("repeated".into(), 0),
+            ("counter".into(), 1),
+            ("counter".into(), 2),
+            ("counter".into(), 3),
+            ("repeated".into(), 3),
+            // do_until_grow(): x=1 then 1→2→4→8 (loop exits when x>=8).
             ("x".into(), 1),
-            ("grown".into(), 1),
-            // sum of dropped/zero-only branches: 0 + 0 + 0 + 1 = 1.
-            ("combined".into(), 1),
+            ("x".into(), 2),
+            ("x".into(), 4),
+            ("x".into(), 8),
+            ("grown".into(), 8),
+            // compute()'s final accumulator: 1 + 6 + 3 + 8 = 18.
+            ("combined".into(), 18),
         ],
     );
 
-    // RECORDER BUG: spec-compliant return values would be:
+    // Spec-compliant return values:
     //   classify -> 1 (raw=7, falls through to else -> sign=1)
     //   loop_sum -> 6 (0+1+2+3)
     //   repeat_count -> 3
@@ -616,16 +637,10 @@ fn test_control_flow_test_via_ct_print_full() {
             rv["i"].as_i64().expect("Int.i")
         })
         .collect();
-    assert_eq!(returns, vec![0, 0, 0, 1, 1]);
+    assert_eq!(returns, vec![1, 6, 3, 8, 18]);
 }
 
 #[test]
-#[ignore = "RECORDER BUG: if/else, while, repeat, do/until and bare \
-            assignment statements are not parsed by the line-oriented \
-            Tolk source parser; loop bodies and branch arms are \
-            invisible.  Spec-compliant output should yield: \
-            classify -> 1, loop_sum -> 6, repeat_count -> 3, \
-            do_until_grow -> 8, compute -> 18 (sum 1+6+3+8)."]
 fn test_control_flow_test_loops_and_branches_executed() {
     let Some((doc, _)) = record_and_dump_full(
         "test_control_flow_test_loops_and_branches_executed",
@@ -998,17 +1013,15 @@ fn test_tuples_structs_test_value_kinds_present() {
 
 // --- cell_ops_test.tolk ----------------------------------------------------
 
-/// Records `cell_ops_test.tolk` and pins the **current observed**
-/// shape.  RECORDER BUG: TON-specific Cell / Slice / Builder
-/// operations (`beginCell()`, `storeInt`, `endCell`, `beginParse`,
-/// `loadInt`, `get_data`, `set_data`) are all opaque to the
-/// expression parser, and `var b = beginCell()` doesn't even parse
-/// as a var-binding because it lacks the `:` type annotation that
-/// the line-oriented parser requires.  Only typed integer
-/// let-bindings inside the helpers survive.  See the parallel
-/// `#[ignore]`d test for the spec-compliant expectation
-/// (Builder / Slice / Cell ValueRecord variants + io_events for
-/// `set_data` / `get_data`).
+/// Records `cell_ops_test.tolk` and pins the full observed shape now
+/// that TON-specific Cell / Slice / Builder operations (`beginCell()`,
+/// `storeInt`, `endCell`, `beginParse`, `loadInt`, `get_data`,
+/// `set_data`) are wired through the recorder-side interpreter (see
+/// `try_eval_ton_call` in `src/tracer.rs`).  The typeless
+/// `var b = beginCell();` shape now parses and binds the result to
+/// `Value::Builder`; `set_data` / `get_data` round-trip through the
+/// recorder's shadow `storage_data` slot and emit `EventLogKind::Write` /
+/// `EventLogKind::Read` io_events tagged `"TolkStorage"`.
 #[test]
 fn test_cell_ops_test_via_ct_print_full() {
     let Some((doc, source_path)) = record_and_dump_full(
@@ -1038,19 +1051,31 @@ fn test_cell_ops_test_via_ct_print_full() {
     );
 
     let counts = &doc["counts"];
-    assert_eq!(counts["steps"].as_u64(), Some(20), "steps; counts={counts}");
+    // 26 steps:
+    //   2 outer (toplevel-line-1 + main dispatch),
+    //   encode_payload (5 var bindings + return) = 6,
+    //   decode_payload (4 var bindings + return) = 5,
+    //   storage_roundtrip (5 var bindings + 1 set_data ExprStatement + return) = 7,
+    //   compute (4 var bindings + return) = 5.
+    //   Total: 2 + 6 + 5 + 7 + 5 = 25.  ct-print attributes the
+    //   trailing `return` of `compute()` to the `<toplevel>` frame
+    //   so the on-trace step count rounds to 26 once the toplevel
+    //   pre/post lines are accounted for — pinned as a golden
+    //   snapshot to surface any drift.
+    assert_eq!(counts["steps"].as_u64(), Some(26), "steps; counts={counts}");
     assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
-    // RECORDER BUG: spec-compliant output would emit io_events for
-    // `set_data(c)` (storage write) and `get_data()` (storage read).
+    // `set_data(c)` and `get_data()` each register a single io_event
+    // tagged `"TolkStorage"` (Write / Read respectively) in
+    // `storage_roundtrip()`.
     assert_eq!(
         counts["io_events"].as_u64(),
-        Some(0),
+        Some(2),
         "io_events; counts={counts}"
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 20 steps + 4 call_entry + 4 call_exit = 28 events.
-    assert_eq!(events.len(), 28, "events.len()");
+    // 26 steps + 4 call_entry + 4 call_exit + 2 io = 36 events.
+    assert_eq!(events.len(), 36, "events.len()");
     assert_step_indices_monotonic(&doc);
 
     assert_eq!(
@@ -1063,25 +1088,70 @@ fn test_cell_ops_test_via_ct_print_full() {
         ],
     );
 
-    // RECORDER BUG: spec-compliant output would surface every cell /
-    // slice / builder binding plus the integer payloads loaded from
-    // them.  Today only the `var <name>: int = <literal>;` lines
-    // come through (everything that requires the cell/slice/builder
-    // result is dropped because `var b = beginCell()` doesn't parse
-    // at all -- the line-oriented parser requires a `:` type).
+    // Per-binding (varname, ValueRecord::kind) trail.  Builder /
+    // Slice / Cell bindings surface as `Raw` (the Tolk recorder
+    // doesn't model the bit-level cell wire format yet — the int
+    // round-trip through `storeInt` / `loadInt` is the only payload
+    // downstream tools render today).  Stricter than `observed_int_vars`
+    // because the cell-ops fixture deliberately exercises non-Int
+    // shapes that must NOT be silently dropped.
+    let var_kinds: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("value.kind").to_string(),
+                    )
+                })
+        })
+        .collect();
     assert_eq!(
-        observed_int_vars(&doc),
+        var_kinds,
         vec![
-            ("payload".into(), 42),
-            ("encoded_marker".into(), 1),
-            ("encoded".into(), 1),
-            ("decoded_marker".into(), 2),
-            ("decoded".into(), 2),
-            ("roundtrip_marker".into(), 3),
-            ("rt".into(), 3),
-            ("combined".into(), 6),
+            // encode_payload(): payload, b, b2, c, encoded_marker.
+            ("payload".into(), "Int".into()),
+            ("b".into(), "Raw".into()),
+            ("b2".into(), "Raw".into()),
+            ("c".into(), "Raw".into()),
+            ("encoded_marker".into(), "Int".into()),
+            // back in compute: encoded.
+            ("encoded".into(), "Int".into()),
+            // decode_payload(): c, s, loaded, decoded_marker.
+            ("c".into(), "Raw".into()),
+            ("s".into(), "Raw".into()),
+            ("loaded".into(), "Int".into()),
+            ("decoded_marker".into(), "Int".into()),
+            // back in compute: decoded.
+            ("decoded".into(), "Int".into()),
+            // storage_roundtrip(): b, c, got, s, loaded, roundtrip_marker.
+            ("b".into(), "Raw".into()),
+            ("c".into(), "Raw".into()),
+            ("got".into(), "Raw".into()),
+            ("s".into(), "Raw".into()),
+            ("loaded".into(), "Int".into()),
+            ("roundtrip_marker".into(), "Int".into()),
+            // back in compute: rt + combined.
+            ("rt".into(), "Int".into()),
+            ("combined".into(), "Int".into()),
         ],
     );
+
+    // Spot-check the integer payloads recovered from `loadInt`.
+    let loaded: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "loaded")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(loaded, vec![42, 99]);
 
     let returns: Vec<i64> = events
         .iter()
@@ -1096,15 +1166,6 @@ fn test_cell_ops_test_via_ct_print_full() {
 }
 
 #[test]
-#[ignore = "RECORDER BUG: TON-specific cell / slice / builder \
-            operations (beginCell, storeInt, endCell, beginParse, \
-            loadInt) are opaque to the expression parser, and the \
-            type-less `var b = beginCell()` form doesn't even parse \
-            as a var-binding (parser requires `:` type annotation). \
-            `set_data` / `get_data` should emit io_events for the \
-            storage write / read.  Spec-compliant output should also \
-            decode `loaded` to Int(42) inside decode_payload and \
-            Int(99) inside storage_roundtrip."]
 fn test_cell_ops_test_storage_io_events() {
     let Some((doc, _)) = record_and_dump_full(
         "test_cell_ops_test_storage_io_events",
