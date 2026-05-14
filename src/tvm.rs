@@ -176,10 +176,7 @@ pub fn tvm_eval_expr(expr: &str, known: &HashMap<String, i64>) -> Option<i64> {
 /// "tvm_exception", &msg)` so they surface on the structured event
 /// channel rather than being silently dropped by `.ok()`. Same shape
 /// as Cairo 1.50 CairoPanic and Miden 1.56 miden_vm_error routing.
-pub fn tvm_eval_expr_checked(
-    expr: &str,
-    known: &HashMap<String, i64>,
-) -> Result<Option<i64>> {
+pub fn tvm_eval_expr_checked(expr: &str, known: &HashMap<String, i64>) -> Result<Option<i64>> {
     let expr = expr.trim();
     if expr.is_empty() {
         return Ok(None);
