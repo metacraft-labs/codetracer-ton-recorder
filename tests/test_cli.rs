@@ -368,9 +368,7 @@ fn test_recorded_trace_via_ct_print_json() {
     ];
     for (name, value) in expected {
         assert!(
-            observed_vars
-                .iter()
-                .any(|(n, v)| n == name && v == value),
+            observed_vars.iter().any(|(n, v)| n == name && v == value),
             "expected step variable `{name}` = {value} in --full output; \
              observed = {observed_vars:?}"
         );
@@ -384,7 +382,12 @@ fn test_recorded_trace_via_ct_print_json() {
     // ValueRecord variant), we want to know loudly.
     let return_values: Vec<&serde_json::Value> = events
         .iter()
-        .filter(|e| e["kind"] == "call_exit" && e["function"].as_str().is_some_and(|f| f.ends_with("compute")))
+        .filter(|e| {
+            e["kind"] == "call_exit"
+                && e["function"]
+                    .as_str()
+                    .is_some_and(|f| f.ends_with("compute"))
+        })
         .map(|e| &e["return_value"])
         .collect();
     assert_eq!(

@@ -6,7 +6,7 @@
 //! events (steps, calls, returns, variables).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use codetracer_trace_types::{EventLogKind, Line, TypeId, TypeKind, ValueRecord, NONE_VALUE};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
@@ -48,6 +48,13 @@ struct FunctionDef {
     /// so future channels (calltrace metadata, frontend filters) can
     /// surface it without re-parsing the source.
     method_id: Option<i64>,
+    /// Absolute path to the source file this function was parsed
+    /// from.  Cross-file fixtures (`import "helpers.tolk";`) carry
+    /// the imported file's path here so step events emitted from the
+    /// imported helper land under the correct source path on the
+    /// frontend's source pane.  See `imports_test.tolk` for the
+    /// canonical fixture.
+    source_path: PathBuf,
 }
 
 /// A parsed statement in a Tolk function body.
@@ -171,6 +178,20 @@ enum Statement {
         mode: GateMode,
         line: u32,
     },
+    /// `match (scrutinee) { Constructor => { ... }; Constructor(payload)
+    /// => { ... }; ... }` — Tolk's pattern-matching dispatch over a
+    /// user-defined sum type.  At runtime we evaluate the scrutinee
+    /// to a `Value::Struct` (whose `type_name` is the variant's
+    /// constructor name), pick the arm whose `constructor` matches
+    /// (NOT a lexical last-arm-wins fallback), bind any
+    /// `payload_binding` to the variant's first field, and execute
+    /// that arm's body in the surrounding `env`.  See
+    /// `match_test.tolk` for the canonical fixture.
+    Match {
+        scrutinee: String,
+        arms: Vec<MatchArm>,
+        line: u32,
+    },
 }
 
 /// Selector for `Statement::GatedThrow` — see its doc comment.
@@ -180,6 +201,20 @@ enum GateMode {
     If,
     /// `throwUnless(<code>, <cond>);` — trip when cond is falsy.
     Unless,
+}
+
+/// A single arm of a `match` statement.  `constructor` is the
+/// variant tag (e.g. `Pending`, `Active`); `payload_binding` is the
+/// optional local-name binder for the variant's first field
+/// (`Active(n)` binds `n` to the variant's first field for the arm
+/// body); `body` is the block that runs when this arm fires.
+#[derive(Debug, Clone)]
+struct MatchArm {
+    constructor: String,
+    payload_binding: Option<String>,
+    body: Vec<Statement>,
+    #[allow(dead_code)]
+    line: u32,
 }
 
 /// A run-time Tolk value flowing through the hand-rolled evaluator.
@@ -222,10 +257,16 @@ enum Value {
     /// abstraction — no real cell bits are constructed — but it's
     /// sufficient to round-trip the values used in
     /// `cell_ops_test.tolk` and `builder_refs_test.tolk`.
-    Builder { payload: Vec<i64>, refs: Vec<Vec<i64>> },
+    Builder {
+        payload: Vec<i64>,
+        refs: Vec<Vec<i64>>,
+    },
     /// Finalised cell, produced by `Builder::endCell` or a chained
     /// `beginCell().storeInt(...).endCell()` expression.
-    Cell { payload: Vec<i64>, refs: Vec<Vec<i64>> },
+    Cell {
+        payload: Vec<i64>,
+        refs: Vec<Vec<i64>>,
+    },
     /// Read-cursor slice produced by `Cell::beginParse`.  `payload`
     /// is the same data the originating cell carried; `pos` advances
     /// as `loadInt(N)` calls consume entries.  `refs` is the
@@ -237,6 +278,29 @@ enum Value {
         refs: Vec<Vec<i64>>,
         ref_pos: usize,
     },
+    /// A `slice` produced from a Tolk source-level string literal —
+    /// either UTF-8 text (`"abc"`) or hex bytes (`0x"abcd"`).  The
+    /// recorder keeps the encoding tag so the resulting
+    /// `ValueRecord::Raw` payload can render `Slice<text> ...`
+    /// vs `Slice<hex> ...` and downstream consumers can tell the
+    /// two literal flavours apart.  See `string_literals_test.tolk`
+    /// for the canonical fixture.
+    SliceLit {
+        encoding: SliceEncoding,
+        bytes: Vec<u8>,
+    },
+}
+
+/// Encoding selector for `Value::SliceLit`.  Tolk's source-level
+/// surface is `"abc"` (text) and `0x"abcd"` (hex); both lift to the
+/// same wire-level `slice` value but the recorder must surface the
+/// distinction so the trace pins each literal flavour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SliceEncoding {
+    /// `"abc"` — UTF-8 codepoints, byte-for-byte.
+    Text,
+    /// `0x"abcd"` — hex nibbles parsed into the raw byte stream.
+    Hex,
 }
 
 impl Value {
@@ -286,19 +350,46 @@ impl TolkTracer {
     /// 4. Writes a CTFS multi-stream `.ct` bundle plus `trace_metadata.json`
     ///    and `trace_paths.json` to `out_dir`.
     pub fn trace_program(source_path: &Path, source_code: &str, out_dir: &Path) -> Result<()> {
-        // -- 1. Parse the Tolk source --
+        // -- 1. Parse the Tolk source.  Cross-file fixtures use
+        // `import "<path>";` to pull in helper modules; those are
+        // loaded recursively (each imported file is parsed once,
+        // tagged with its own source path, and merged into the
+        // function pool).  See `imports_test.tolk` for the canonical
+        // multi-file fixture.
         let _source_map = SourceMap::from_source(source_path, source_code);
-        let functions = parse_functions(source_code);
+        let mut functions = parse_functions(source_code, source_path);
+        let mut already_imported: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        already_imported.insert(source_path.to_path_buf());
+        let mut imported_sources: Vec<String> = Vec::new();
+        load_imports_recursive(
+            source_path,
+            source_code,
+            &mut functions,
+            &mut already_imported,
+            &mut imported_sources,
+        );
 
         eprintln!("Parsed {} functions", functions.len());
 
         // -- 2. Create the trace writer (CTFS only) --
         let program_str = source_path.to_string_lossy();
+        // Collect variant-constructor names from BOTH the entry file
+        // and every imported file.  This keeps the
+        // `Pending`/`Active`/`Failed` lift to `ValueRecord::Variant`
+        // working when the union declaration lives in an imported
+        // helper module.
+        let mut variant_ctors = parse_variant_constructors(source_code);
+        for src in &imported_sources {
+            for name in parse_variant_constructors(src) {
+                variant_ctors.insert(name);
+            }
+        }
         let mut tracer = TolkTracer {
             writer: create_trace_writer(&program_str, &[], CTFS_FORMAT),
             type_ids: HashMap::new(),
             storage_data: None,
-            variant_constructors: parse_variant_constructors(source_code),
+            variant_constructors: variant_ctors,
         };
 
         // -- 3. Initialise output files --
@@ -445,14 +536,7 @@ impl TolkTracer {
         // its body runs at depth 0 — see the comment in the original
         // arm for the navigation rationale.
         if let Some(main_fn) = func_map.get("main") {
-            self.evaluate_function(
-                source_path,
-                main_fn,
-                &func_map,
-                &mut env,
-                true,
-                &[],
-            )?;
+            self.evaluate_function(source_path, main_fn, &func_map, &mut env, true, &[])?;
             return Ok(());
         }
 
@@ -481,11 +565,8 @@ impl TolkTracer {
 
         for (idx, name) in present.iter().enumerate() {
             let entry_fn = func_map.get(*name).expect("present-filter");
-            let synthetic_args: Vec<Value> = entry_fn
-                .params
-                .iter()
-                .map(|_| Value::Int(0))
-                .collect();
+            let synthetic_args: Vec<Value> =
+                entry_fn.params.iter().map(|_| Value::Int(0)).collect();
             // First entry merges into <toplevel> to keep its body at
             // depth 0 (same constraint as `main()`); any subsequent
             // entry runs as a non-entry-point call so its body opens
@@ -536,11 +617,8 @@ impl TolkTracer {
                 let type_id = if let Some(id) = self.type_ids.get(type_name).copied() {
                     id
                 } else {
-                    let id = TraceWriter::ensure_type_id(
-                        &mut *self.writer,
-                        TypeKind::Struct,
-                        type_name,
-                    );
+                    let id =
+                        TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::Struct, type_name);
                     self.type_ids.insert(type_name.clone(), id);
                     id
                 };
@@ -603,6 +681,41 @@ impl TolkTracer {
                 text.push_str(&format!(" @{pos}/r{ref_pos}"));
                 ValueRecord::Raw { r: text, type_id }
             }
+            Value::SliceLit { encoding, bytes } => {
+                // Source-level literal slices register under their
+                // encoding-specific type name so the trace's `type_id`
+                // is stable per flavour and a downstream consumer can
+                // route on the type before even looking at the
+                // payload string.  The payload string is rendered as
+                // `Slice<text> "abc"` (text) or `Slice<hex> 0x"abcd"`
+                // (hex) — both shapes round-trip the original source
+                // form so the test corpus pins them exactly.
+                let (type_name, payload_text) = match encoding {
+                    SliceEncoding::Text => {
+                        let body = String::from_utf8(bytes.clone()).unwrap_or_else(|_| {
+                            // Fall back to a byte-oriented dump if
+                            // the literal isn't valid UTF-8 (Tolk
+                            // does allow `"\\xNN"` escapes that
+                            // could break this; we don't see any
+                            // in the current fixtures).
+                            bytes
+                                .iter()
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<String>()
+                        });
+                        ("TolkSliceText", format!("Slice<text> \"{body}\""))
+                    }
+                    SliceEncoding::Hex => {
+                        let nibbles: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                        ("TolkSliceHex", format!("Slice<hex> 0x\"{nibbles}\""))
+                    }
+                };
+                let type_id = self.ensure_raw_type_id(type_name);
+                ValueRecord::Raw {
+                    r: payload_text,
+                    type_id,
+                }
+            }
         }
     }
 
@@ -635,13 +748,21 @@ impl TolkTracer {
     /// unknown identifier rather than panicking).
     fn evaluate_function(
         &mut self,
-        source_path: &Path,
+        _caller_source_path: &Path,
         func: &FunctionDef,
         func_map: &HashMap<String, &FunctionDef>,
         _parent_env: &mut HashMap<String, Value>,
         is_entry_point: bool,
         args: &[Value],
     ) -> Result<Option<Value>> {
+        // Per-function source path: cross-file fixtures
+        // (`import "helpers.tolk";`) tag each `FunctionDef` with the
+        // file it was parsed from, so step events emitted from the
+        // imported helper land under the correct source path on the
+        // frontend.  Pre-this-fixture every step inherited the entry
+        // file's path regardless of where the function actually
+        // lived; see `imports_test.tolk` for the canonical fixture.
+        let source_path: &Path = func.source_path.as_path();
         // Register function metadata (for function list / calltrace).
         let fn_id = TraceWriter::ensure_function_id(
             &mut *self.writer,
@@ -690,13 +811,8 @@ impl TolkTracer {
         // only meaningful for the linear var-binding stream.
         let mut sym_stack = StackTracker::new();
 
-        let exit = self.execute_block(
-            source_path,
-            &func.body,
-            func_map,
-            &mut env,
-            &mut sym_stack,
-        )?;
+        let exit =
+            self.execute_block(source_path, &func.body, func_map, &mut env, &mut sym_stack)?;
         let return_value = match exit {
             BlockExit::Returned(v) => v,
             _ => None,
@@ -737,7 +853,10 @@ impl TolkTracer {
         source_path: &Path,
         func_map: &HashMap<String, &FunctionDef>,
     ) -> Result<Option<i64>> {
-        let expr = expr.trim();
+        // Strip the value-level `as <T>` suffix — see the matching
+        // comment in `eval_expr_to_value`.
+        let stripped_owned = strip_as_casts(expr);
+        let expr = stripped_owned.trim();
 
         if expr.is_empty() {
             return Ok(None);
@@ -848,9 +967,28 @@ impl TolkTracer {
         source_path: &Path,
         func_map: &HashMap<String, &FunctionDef>,
     ) -> Result<Option<Value>> {
-        let expr = expr.trim();
+        // Strip Tolk's value-level `as <T>` cast suffix at the top
+        // level — Tolk treats it as a no-op at the value level (the
+        // alias `type Coins = int;` doesn't introduce a new wire
+        // shape, just a friendlier source-level name), so we recover
+        // the bare expression for the downstream evaluator.  See
+        // `type_aliases_casting_test.tolk` for the canonical fixture.
+        let stripped_owned = strip_as_casts(expr);
+        let expr = stripped_owned.trim();
         if expr.is_empty() {
             return Ok(None);
+        }
+
+        // 0a. String slice literals — Tolk's `"abc"` (UTF-8 text) and
+        // `0x"abcd"` (hex bytes).  Both lift to `Value::SliceLit`
+        // with the encoding tag preserved so the resulting
+        // `ValueRecord::Raw` payload renders distinctly per flavour
+        // (see `value_to_record`).  Recognised before the call /
+        // struct / tuple arms because the literal text starts with a
+        // `"` (or `0x"`) which none of those arms accept anyway, but
+        // the explicit arm makes the resolution order obvious.
+        if let Some(lit) = parse_slice_literal(expr) {
+            return Ok(Some(lit));
         }
 
         // 0. Method-chain calls (`<lhs>.<method>(<args>)`) and TON
@@ -1010,19 +1148,12 @@ impl TolkTracer {
                 line,
             } => {
                 // Emit Step event.
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(*line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
-                if let Some(val) =
-                    self.eval_expr_to_value(expr, env, source_path, func_map)?
-                {
+                if let Some(val) = self.eval_expr_to_value(expr, env, source_path, func_map)? {
                     if let Some(int_val) = val.as_i64() {
                         let int_env = value_env_to_i64_map(env);
-                        let expr_tracker =
-                            stack_tracker::track_expr(expr, &int_env, int_val);
+                        let expr_tracker = stack_tracker::track_expr(expr, &int_env, int_val);
                         let _derived = expr_tracker.variables_at_step();
                         sym_stack.push(int_val, Some(name.clone()));
                     }
@@ -1032,49 +1163,29 @@ impl TolkTracer {
                             let type_id = type_name
                                 .as_deref()
                                 .and_then(|n| self.type_ids.get(n).copied())
-                                .unwrap_or_else(|| {
-                                    self.type_ids.get("int").copied().unwrap()
-                                });
+                                .unwrap_or_else(|| self.type_ids.get("int").copied().unwrap());
                             ValueRecord::Int { i: *i, type_id }
                         }
                         _ => self.value_to_record(&val),
                     };
                     env.insert(name.clone(), val);
-                    TraceWriter::register_variable_with_full_value(
-                        &mut *self.writer,
-                        name,
-                        value,
-                    );
+                    TraceWriter::register_variable_with_full_value(&mut *self.writer, name, value);
                 }
                 Ok(BlockExit::Fallthrough)
             }
             Statement::Assign { name, expr, line } => {
                 // Emit Step event for the assignment line.
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(*line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
-                if let Some(val) =
-                    self.eval_expr_to_value(expr, env, source_path, func_map)?
-                {
+                if let Some(val) = self.eval_expr_to_value(expr, env, source_path, func_map)? {
                     let value = self.value_to_record(&val);
                     env.insert(name.clone(), val);
-                    TraceWriter::register_variable_with_full_value(
-                        &mut *self.writer,
-                        name,
-                        value,
-                    );
+                    TraceWriter::register_variable_with_full_value(&mut *self.writer, name, value);
                 }
                 Ok(BlockExit::Fallthrough)
             }
             Statement::Return { expr, line } => {
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(*line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
                 let val = self.eval_expr_to_value(expr, env, source_path, func_map)?;
                 Ok(BlockExit::Returned(val))
@@ -1095,11 +1206,7 @@ impl TolkTracer {
             } => {
                 // Emit a Step event for the if-header line so the
                 // branch shows up in the calltrace pane.
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(*line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
                 let cond_val = self.eval_cond(cond, env, source_path, func_map)?;
                 let arm = if cond_val { then_block } else { else_block };
                 self.execute_block(source_path, arm, func_map, env, sym_stack)
@@ -1107,11 +1214,7 @@ impl TolkTracer {
             Statement::While { cond, body, line } => {
                 // Emit a Step event for the loop header so the loop
                 // construct itself shows up in the trace.
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(*line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
                 let mut iters = 0u32;
                 loop {
                     if iters >= LOOP_ITERATION_BOUND {
@@ -1137,11 +1240,7 @@ impl TolkTracer {
                 body,
                 line,
             } => {
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(*line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
                 let count = self
                     .eval_expr_to_value(count_expr, env, source_path, func_map)?
                     .and_then(|v| v.as_i64())
@@ -1164,11 +1263,7 @@ impl TolkTracer {
                 Ok(BlockExit::Fallthrough)
             }
             Statement::DoUntil { body, cond, line } => {
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(*line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
                 let mut iters = 0u32;
                 loop {
                     if iters >= LOOP_ITERATION_BOUND {
@@ -1195,11 +1290,7 @@ impl TolkTracer {
                 // expression for its side effects (`set_data(c);`,
                 // method-chain mutations on a builder, etc.).  The
                 // returned value is intentionally discarded.
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(*line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
                 let _ = self.eval_expr_to_value(expr, env, source_path, func_map)?;
                 Ok(BlockExit::Fallthrough)
             }
@@ -1212,11 +1303,7 @@ impl TolkTracer {
                 // Emit a Step event for the guard line so the branch
                 // shows up in the calltrace pane regardless of whether
                 // the gate trips.
-                TraceWriter::register_step(
-                    &mut *self.writer,
-                    source_path,
-                    Line(*line as i64),
-                );
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
                 // Evaluate the condition.  `eval_cond` already
                 // normalises any TVM-side `-1` ("true") and missing
                 // values to a Rust `bool`; we then route that against
@@ -1247,6 +1334,53 @@ impl TolkTracer {
                 } else {
                     Ok(BlockExit::Fallthrough)
                 }
+            }
+            Statement::Match {
+                scrutinee,
+                arms,
+                line,
+            } => {
+                // Emit a Step event for the match-header line so the
+                // dispatch shows up in the calltrace pane.
+                TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
+                // Resolve the scrutinee to a `Value::Struct` so we
+                // can read its variant tag (the `type_name`) and any
+                // payload field.  A non-struct scrutinee produces no
+                // arm dispatch — we simply fall through (mirroring
+                // the recorder's "best-effort, never panic"
+                // discipline).
+                let scrutinee_val =
+                    self.eval_expr_to_value(scrutinee, env, source_path, func_map)?;
+                let (ctor_tag, first_field): (Option<String>, Option<Value>) = match &scrutinee_val
+                {
+                    Some(Value::Struct { type_name, fields }) => (
+                        Some(type_name.clone()),
+                        fields.first().map(|(_n, v)| v.clone()),
+                    ),
+                    _ => (None, None),
+                };
+                let Some(tag) = ctor_tag else {
+                    return Ok(BlockExit::Fallthrough);
+                };
+                // Pick the spec-correct arm: the one whose
+                // constructor name matches the scrutinee's tag.
+                // First match wins; this is NOT a lexical
+                // last-arm-wins fallback.
+                let arm = arms.iter().find(|a| a.constructor == tag);
+                let Some(arm) = arm else {
+                    // Unmatched scrutinee — no arm fires.  Mirrors
+                    // the cardano recorder's "missing arm =
+                    // fallthrough" behaviour.
+                    return Ok(BlockExit::Fallthrough);
+                };
+                // Bind the variant payload (if the arm names one)
+                // before executing the body.  Tolk's `Active(n)`
+                // form binds `n` to the variant's first field for
+                // the duration of the arm.
+                if let (Some(binder), Some(payload)) = (&arm.payload_binding, &first_field) {
+                    env.insert(binder.clone(), payload.clone());
+                }
+                self.execute_block(source_path, &arm.body, func_map, env, sym_stack)
             }
         }
     }
@@ -1322,9 +1456,7 @@ impl TolkTracer {
                 return Ok(Some(Value::Cell { payload, refs }));
             }
             if (name == "set_data" || name == "save_data") && args.len() == 1 {
-                if let Some(val) =
-                    self.eval_expr_to_value(&args[0], env, source_path, func_map)?
-                {
+                if let Some(val) = self.eval_expr_to_value(&args[0], env, source_path, func_map)? {
                     let summary = match &val {
                         Value::Cell { payload, refs } => {
                             format_payload_with_refs("Cell", payload, refs)
@@ -1369,8 +1501,7 @@ impl TolkTracer {
             // int-projection below remained valid; the new arms
             // consult `arg_value_records` directly for the cell-bearing
             // args.
-            let mut arg_value_records: Vec<Option<Value>> =
-                Vec::with_capacity(arg_strs.len());
+            let mut arg_value_records: Vec<Option<Value>> = Vec::with_capacity(arg_strs.len());
             for a in &arg_strs {
                 let v = self.eval_expr_to_value(a, env, source_path, func_map)?;
                 arg_value_records.push(v);
@@ -1419,7 +1550,9 @@ impl TolkTracer {
                     let ref_payload = match arg_value_records.first().and_then(|v| v.clone()) {
                         Some(Value::Cell { payload: p, .. }) => p,
                         Some(Value::Builder { payload: p, .. }) => p,
-                        Some(Value::Slice { payload: p, pos, .. }) => {
+                        Some(Value::Slice {
+                            payload: p, pos, ..
+                        }) => {
                             // Drain the slice's remaining int payload
                             // (positions >= pos).  This matches the
                             // TON convention that a slice converted
@@ -1482,9 +1615,7 @@ impl TolkTracer {
                     let (payload, refs) = match base {
                         Value::Cell { payload, refs } => (payload, refs),
                         Value::Builder { payload, refs } => (payload, refs),
-                        Value::Slice {
-                            payload, refs, ..
-                        } => (payload, refs),
+                        Value::Slice { payload, refs, .. } => (payload, refs),
                         _ => return Ok(None),
                     };
                     return Ok(Some(Value::Slice {
@@ -1571,16 +1702,11 @@ impl TolkTracer {
                             let callee = (*callee).clone();
                             // Build the actuals: receiver first, then
                             // the parsed positional args.
-                            let mut arg_vals: Vec<Value> =
-                                Vec::with_capacity(arg_strs.len() + 1);
+                            let mut arg_vals: Vec<Value> = Vec::with_capacity(arg_strs.len() + 1);
                             arg_vals.push(base.clone());
                             let mut all_args_ok = true;
                             for (i, a) in arg_strs.iter().enumerate() {
-                                match arg_value_records
-                                    .get(i)
-                                    .cloned()
-                                    .flatten()
-                                {
+                                match arg_value_records.get(i).cloned().flatten() {
                                     Some(v) => arg_vals.push(v),
                                     None => {
                                         // Re-evaluate (the first pass
@@ -1588,7 +1714,10 @@ impl TolkTracer {
                                         // returned None for a
                                         // non-int-flat shape).
                                         match self.eval_expr_to_value(
-                                            a, env, source_path, func_map,
+                                            a,
+                                            env,
+                                            source_path,
+                                            func_map,
                                         )? {
                                             Some(v) => arg_vals.push(v),
                                             None => {
@@ -1600,8 +1729,7 @@ impl TolkTracer {
                                 }
                             }
                             if all_args_ok {
-                                let mut dummy_env: HashMap<String, Value> =
-                                    HashMap::new();
+                                let mut dummy_env: HashMap<String, Value> = HashMap::new();
                                 let result = self.evaluate_function(
                                     source_path,
                                     &callee,
@@ -1687,6 +1815,51 @@ fn value_env_to_i64_map(env: &HashMap<String, Value>) -> HashMap<String, i64> {
         .collect()
 }
 
+/// Strip Tolk's value-level `as <T>` cast suffix from an expression.
+/// Returns the input unchanged when no matching ` as <ident>` token
+/// is present.
+///
+/// Tolk's `as` keyword is a value-level no-op when it crosses a
+/// `type Coins = int;` style alias (and in real-world contracts that
+/// is the only shape that actually reaches the recorder — the more
+/// adventurous `as` shapes touch storage layout, which the recorder
+/// doesn't model).  So the right thing for the int-only TVM
+/// evaluator and for the `Value`-aware evaluator is the same: drop
+/// the cast and forward the underlying expression unchanged.
+///
+/// We walk the expression byte-by-byte and recognise ` as ` at any
+/// bracket depth (Tolk semantics: an `as` cast is a no-op whether it
+/// sits at the top level or nested inside a parenthesised
+/// sub-expression).  The pattern repeats so chained casts like
+/// `(x as A) as B` collapse fully.
+fn strip_as_casts(input: &str) -> String {
+    let s = input;
+    // Fast path: no `as` substring at all.
+    if !s.contains(" as ") {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Recognise ` as ` (whitespace-bounded `as` keyword) and skip
+        // past the trailing type identifier.  The leading space is
+        // consumed (not re-emitted) so `balance as Coins` becomes
+        // `balance` rather than `balance ` (no trailing space).
+        if i + 4 <= bytes.len() && &bytes[i..i + 4] == b" as " {
+            let mut j = i + 4;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Rewrite every `<ident>.<field-or-index>` subterm of `expr` (where
 /// `<ident>` is bound in `env` to a `Value::Struct` or `Value::Tuple`)
 /// to the resolved scalar literal text.  Used by `eval_expr` to bridge
@@ -1719,9 +1892,7 @@ fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
                 // `<ident>.<field>` — gather the field run (alnum / _).
                 let field_start = i + 1;
                 let mut j = field_start;
-                while j < bytes.len()
-                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
-                {
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                     j += 1;
                 }
                 if j > field_start {
@@ -1765,7 +1936,76 @@ fn resolve_field_accesses(expr: &str, env: &HashMap<String, Value>) -> String {
 /// Handles the pattern: `fun <name>(<params>): <type> { ... }`
 /// and recursively parses control-flow blocks (`if`, `else`, `while`,
 /// `repeat`, `do`/`until`) inside each body.
-fn parse_functions(source: &str) -> Vec<FunctionDef> {
+/// Recursively load every `import "<path>";` declaration found in
+/// `source` (the contents of `from_path`).  Each imported file is
+/// resolved relative to `from_path`'s parent directory (Tolk's
+/// canonical lookup: imports are sibling-relative, not project-root
+/// relative).  Already-loaded files are tracked in `already_imported`
+/// so a diamond `A imports B imports A` doesn't re-parse anything.
+/// Functions parsed from each imported file are appended to
+/// `functions` with their own source-path tag preserved (so step
+/// events emit under the correct path).
+fn load_imports_recursive(
+    from_path: &Path,
+    source: &str,
+    functions: &mut Vec<FunctionDef>,
+    already_imported: &mut std::collections::HashSet<PathBuf>,
+    imported_sources: &mut Vec<String>,
+) {
+    let parent = from_path.parent().unwrap_or_else(|| Path::new("."));
+    for raw in source.lines() {
+        let line = raw.trim();
+        // Tolk's canonical import shape is `import "path";`; tolerate
+        // optional trailing semicolons and surrounding whitespace.
+        let after = match line.strip_prefix("import") {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        // Strip the open quote, then capture up to the close quote.
+        let after = match after.strip_prefix('"') {
+            Some(s) => s,
+            None => continue,
+        };
+        let close = match after.find('"') {
+            Some(p) => p,
+            None => continue,
+        };
+        let rel_path = &after[..close];
+        if rel_path.is_empty() {
+            continue;
+        }
+        let import_path = parent.join(rel_path);
+        let canonical = import_path
+            .canonicalize()
+            .unwrap_or_else(|_| import_path.clone());
+        if !already_imported.insert(canonical.clone()) {
+            continue;
+        }
+        let imported_source = match std::fs::read_to_string(&import_path) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!(
+                    "warn: import \"{}\" from {} failed: {err}",
+                    rel_path,
+                    from_path.display()
+                );
+                continue;
+            }
+        };
+        let imported_funcs = parse_functions(&imported_source, &import_path);
+        functions.extend(imported_funcs);
+        imported_sources.push(imported_source.clone());
+        load_imports_recursive(
+            &import_path,
+            &imported_source,
+            functions,
+            already_imported,
+            imported_sources,
+        );
+    }
+}
+
+fn parse_functions(source: &str, source_path: &Path) -> Vec<FunctionDef> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
     let mut i = 0;
@@ -1794,12 +2034,9 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
                 if let Some(paren_open) = name_and_args.find('(') {
                     let name = name_and_args[..paren_open].trim();
                     if name == "method_id" {
-                        if let Some(paren_close) =
-                            name_and_args[paren_open + 1..].find(')')
-                        {
-                            let arg = name_and_args
-                                [paren_open + 1..paren_open + 1 + paren_close]
-                                .trim();
+                        if let Some(paren_close) = name_and_args[paren_open + 1..].find(')') {
+                            let arg =
+                                name_and_args[paren_open + 1..paren_open + 1 + paren_close].trim();
                             if let Ok(n) = arg.parse::<i64>() {
                                 pending_method_id = Some(n);
                             }
@@ -1832,9 +2069,13 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
         let (receiver_type, after_receiver) = parse_receiver_prefix(after_keyword);
         let after_keyword = after_receiver;
 
-        // Parse function name.
+        // Parse function name.  Strip any generic-parameter suffix
+        // (`fun max<T>(...)` registers under the bare name `max`) so
+        // the call-site lookup symmetrically resolves
+        // `max<int>(3, 5)` → declared `max`.  See `strip_generic_args`
+        // for the semantics.
         let name_end = after_keyword.find('(').unwrap_or(after_keyword.len());
-        let bare_name = after_keyword[..name_end].trim().to_string();
+        let bare_name = strip_generic_args(after_keyword[..name_end].trim()).to_string();
         let name = match &receiver_type {
             Some(t) => format!("{t}.{bare_name}"),
             None => bare_name,
@@ -1891,6 +2132,7 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
                 body,
                 line: line_num,
                 method_id: pending_method_id.take(),
+                source_path: source_path.to_path_buf(),
             });
         } else {
             // No name resolved — drop any pending attribute so the
@@ -1947,8 +2189,7 @@ fn parse_block(lines: &[&str], start: usize) -> (Vec<Statement>, usize) {
             // `}` line may carry a trailing `else if (...)` /
             // `else {` token (e.g. `} else if (raw == 0) {`); fall
             // back to the next line for the `else { ... }` form.
-            let (else_block, advance_to) =
-                parse_else_clauses(lines, then_end);
+            let (else_block, advance_to) = parse_else_clauses(lines, then_end);
             body.push(Statement::If {
                 cond,
                 then_block,
@@ -1981,6 +2222,21 @@ fn parse_block(lines: &[&str], start: usize) -> (Vec<Statement>, usize) {
             continue;
         }
 
+        // `match (scrutinee) {` opens a pattern-matching dispatch.
+        // Each line inside is one arm of the form
+        // `Constructor => { ... };` or `Constructor(payload) => { ... };`.
+        // The arm body itself is parsed via `parse_block` recursively.
+        if let Some(scrutinee) = strip_block_header(trimmed, "match") {
+            let (arms, end) = parse_match_arms(lines, idx + 1);
+            body.push(Statement::Match {
+                scrutinee,
+                arms,
+                line: line_num,
+            });
+            idx = end + 1;
+            continue;
+        }
+
         // `do {` opens a loop body that ends with `} until (cond);`.
         // The `}` line itself carries the `until (cond);` suffix that
         // we need to capture as the loop's condition.
@@ -1990,10 +2246,7 @@ fn parse_block(lines: &[&str], start: usize) -> (Vec<Statement>, usize) {
             let close_line = lines[end_line].trim();
             // Strip the leading `}`, then `until`, then the
             // parenthesised condition.
-            let after_brace = close_line
-                .strip_prefix('}')
-                .unwrap_or(close_line)
-                .trim();
+            let after_brace = close_line.strip_prefix('}').unwrap_or(close_line).trim();
             let cond = if let Some(rest) = after_brace.strip_prefix("until") {
                 let rest = rest.trim();
                 rest.strip_prefix('(')
@@ -2164,13 +2417,98 @@ fn parse_else_clauses(lines: &[&str], close_idx: usize) -> (Vec<Statement>, usiz
     (Vec::new(), close_idx)
 }
 
+/// Parse the body of a `match (scrutinee) { ... }` block.  Each arm
+/// is one source line of the shape:
+///
+///   `Constructor => { <stmt>; <stmt>; };`
+///   `Constructor(payload) => { <stmt>; ... };`
+///
+/// Multi-line arm bodies are also accepted (the joiner gathers
+/// continuations until the brace pair balances).  Returns the
+/// collected `MatchArm`s plus the line index of the closing `}`.
+///
+/// The recorder only consumes one statement per arm body in
+/// practice (the canonical shape is `Active(n) => { result = n; };`),
+/// but the parser is happy to take a multi-statement arm — the
+/// runtime arm-execution path walks the full statement list.
+fn parse_match_arms(lines: &[&str], start: usize) -> (Vec<MatchArm>, usize) {
+    let mut arms = Vec::new();
+    let mut idx = start;
+    while idx < lines.len() {
+        let trimmed = lines[idx].trim();
+        if trimmed.starts_with('}') {
+            return (arms, idx);
+        }
+        if trimmed.is_empty() {
+            idx += 1;
+            continue;
+        }
+        // Gather any continuation lines so a multi-line arm body
+        // (`Active(n) => {\n    result = n;\n};`) joins into a
+        // single logical line.
+        let (joined, consumed) = gather_logical_line(lines, idx);
+        let line_num = (idx + 1) as u32;
+        if let Some(arm) = parse_match_arm(&joined, line_num) {
+            arms.push(arm);
+        }
+        idx += consumed;
+    }
+    (arms, idx)
+}
+
+/// Parse a single match arm of the form
+/// `Constructor[(<binding>)] => { <body> };` (the trailing `;` is
+/// optional).  Returns `None` if the line doesn't match.
+fn parse_match_arm(line: &str, line_num: u32) -> Option<MatchArm> {
+    let s = line.trim().trim_end_matches(';').trim();
+    let arrow = s.find("=>")?;
+    let lhs = s[..arrow].trim();
+    let rhs = s[arrow + 2..].trim();
+    // LHS shape: `Constructor` or `Constructor(<binding>)`.
+    let (constructor, payload_binding) = if let Some(paren_open) = lhs.find('(') {
+        let ctor = lhs[..paren_open].trim().to_string();
+        let inner = lhs[paren_open + 1..].trim_end_matches(')').trim();
+        if !is_simple_identifier(inner) {
+            return None;
+        }
+        (ctor, Some(inner.to_string()))
+    } else {
+        (lhs.to_string(), None)
+    };
+    if !is_simple_identifier(&constructor) {
+        return None;
+    }
+    // RHS: must be a `{ ... }` brace block.  Strip the outer braces
+    // and parse the inner statements via the same per-line driver.
+    let inner = rhs.strip_prefix('{')?.trim();
+    let inner = inner.strip_suffix('}')?.trim();
+    let mut body = Vec::new();
+    for stmt_text in inner.split(';') {
+        let stmt_text = stmt_text.trim();
+        if stmt_text.is_empty() {
+            continue;
+        }
+        // Re-attach the trailing `;` so `parse_statement` recognises
+        // the shape (it strips it itself, but several arms only
+        // accept the `<...>;` form).
+        let with_semi = format!("{stmt_text};");
+        if let Some(stmt) = parse_statement(&with_semi, line_num) {
+            body.push(stmt);
+        }
+    }
+    Some(MatchArm {
+        constructor,
+        payload_binding,
+        body,
+        line: line_num,
+    })
+}
+
 /// Recognise a block-introducing line of the shape
 /// `<keyword> (<expr>) {` and return the parenthesised expression.
 /// Returns `None` if the line doesn't match the shape exactly.
 fn strip_block_header(line: &str, keyword: &str) -> Option<String> {
-    let rest = line
-        .strip_prefix(keyword)?
-        .trim_start();
+    let rest = line.strip_prefix(keyword)?.trim_start();
     let rest = rest.strip_prefix('(')?;
     // Find the matching close paren at depth 0; everything after
     // must be `{` (optionally with whitespace).
@@ -2250,10 +2588,7 @@ fn parse_variant_constructors(source: &str) -> std::collections::HashSet<String>
             Some(p) => p,
             None => continue,
         };
-        let rhs = after_type[eq_pos + 1..]
-            .trim()
-            .trim_end_matches(';')
-            .trim();
+        let rhs = after_type[eq_pos + 1..].trim().trim_end_matches(';').trim();
         for part in rhs.split('|') {
             let name = part.trim();
             // Tolk allows `Active(int)` style payload signatures in
@@ -2609,14 +2944,21 @@ fn parse_call_with_args(expr: &str) -> Option<(&str, Vec<String>)> {
         }
     }
     let open = open_pos?;
-    let name = expr[..open].trim();
-    if name.is_empty() {
+    let raw_name = expr[..open].trim();
+    if raw_name.is_empty() {
         return None;
     }
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_')
-        || !name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+    // Tolk's monomorphised call-site syntax is `max<int>(3, 5)` —
+    // strip the trailing `<...>` group so the lookup matches the
+    // declared `max(...)`.  See `strip_generic_args` for the
+    // semantics; non-generic call sites pass through unchanged.
+    let name = strip_generic_args(raw_name);
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+        || !name
+            .chars()
+            .next()
+            .map(|c| c.is_alphabetic() || c == '_')
+            .unwrap_or(false)
     {
         return None;
     }
@@ -2751,6 +3093,53 @@ fn is_simple_identifier(s: &str) -> bool {
     chars.all(|c| c.is_alphanumeric() || c == '_')
 }
 
+/// Strip a Tolk generic-argument suffix (`<...>`) from a function- or
+/// type-name token.  Tolk's parametric polymorphism surface is
+/// Rust-flavoured: `fun max<T>(...)` declares the generic helper, and
+/// `max<int>(3, 5)` instantiates it with `T = int` at the call site.
+/// At the recorder level we don't carry per-instantiation type info
+/// (the trace's `ValueRecord` shape is a function of the runtime
+/// `Value`, not the source-level type variable), so we collapse every
+/// monomorphised name back to the bare ident.  This makes the lookup
+/// in the function map symmetric: both `parse_functions` (declaration
+/// side) and `parse_call_with_args` / `parse_struct_literal`
+/// (call/literal side) call this helper before consulting the map.
+///
+/// We strip a single trailing `<...>` group, properly bracket-balanced
+/// so we don't mis-parse a comparison like `a < b`.  Multi-arg
+/// generics (`Map<K, V>`) and nested ones (`Vec<Box<int>>`) collapse
+/// to the bare ident in one pass.  Returns the original token
+/// unchanged if no `<` is present or the brackets don't balance.
+fn strip_generic_args(s: &str) -> &str {
+    let trimmed = s.trim();
+    let bytes = trimmed.as_bytes();
+    if !trimmed.ends_with('>') {
+        return trimmed;
+    }
+    // Walk from the right counting `>` / `<` pairs.  The matching `<`
+    // for the trailing `>` is the splitter; everything before it is
+    // the bare ident.
+    let mut depth = 0i32;
+    let mut open_pos: Option<usize> = None;
+    for i in (0..bytes.len()).rev() {
+        match bytes[i] {
+            b'>' => depth += 1,
+            b'<' => {
+                depth -= 1;
+                if depth == 0 {
+                    open_pos = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    match open_pos {
+        Some(p) => trimmed[..p].trim_end(),
+        None => trimmed,
+    }
+}
+
 /// Find a top-level `.` separator between a left-hand expression and a
 /// single trailing field name / numeric index.  Used by
 /// `eval_expr_to_value` to recognise field-access expressions like `p.x`
@@ -2826,6 +3215,92 @@ fn parse_tuple_literal(expr: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
+/// Recognise a Tolk source-level string slice literal.  Returns the
+/// resulting `Value::SliceLit` for either the UTF-8 text shape
+/// (`"abc"`) or the hex shape (`0x"abcd"`); returns `None` for
+/// non-literal expressions.
+///
+/// We accept only the bare literal text — no concatenation, no
+/// escape sequences past the most basic ones (`\\`, `\"`).  Real-
+/// world Tolk supports a richer escape grammar (`\n`, `\t`,
+/// `\xNN`, …); the small set above is enough for the corpus we
+/// need to record today and the helper degrades gracefully for
+/// unrecognised escapes (it leaves them in the byte stream so the
+/// trace still surfaces something tractable).
+fn parse_slice_literal(expr: &str) -> Option<Value> {
+    let s = expr.trim();
+    if s.len() < 2 {
+        return None;
+    }
+    // Hex shape: `0x"..."`.
+    if let Some(rest) = s.strip_prefix("0x\"").or_else(|| s.strip_prefix("0X\"")) {
+        let body = rest.strip_suffix('"')?;
+        // Strip whitespace from the body so `0x"ab cd"` (rare but
+        // legal) round-trips like `0x"abcd"`.  Reject any character
+        // outside `[0-9a-fA-F]` so we don't accidentally accept a
+        // typo'd literal.
+        let mut clean = String::with_capacity(body.len());
+        for ch in body.chars() {
+            if ch.is_ascii_whitespace() {
+                continue;
+            }
+            if !ch.is_ascii_hexdigit() {
+                return None;
+            }
+            clean.push(ch);
+        }
+        // An odd nibble count means the literal is half a byte; we
+        // pad with a trailing `0` so the byte stream stays
+        // well-defined (matches what TON's slice constructor does
+        // for `0x"abc"` style literals).
+        if clean.len() % 2 == 1 {
+            clean.push('0');
+        }
+        let mut bytes = Vec::with_capacity(clean.len() / 2);
+        let mut chars = clean.chars();
+        while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
+            let hi = hi.to_digit(16)? as u8;
+            let lo = lo.to_digit(16)? as u8;
+            bytes.push((hi << 4) | lo);
+        }
+        return Some(Value::SliceLit {
+            encoding: SliceEncoding::Hex,
+            bytes,
+        });
+    }
+    // Text shape: `"..."`.
+    if let Some(rest) = s.strip_prefix('"') {
+        let body = rest.strip_suffix('"')?;
+        // Cheap escape pass: handle only `\\`, `\"`, `\n`, `\t`.
+        let mut bytes = Vec::with_capacity(body.len());
+        let mut chars = body.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('\\') => bytes.push(b'\\'),
+                    Some('"') => bytes.push(b'"'),
+                    Some('n') => bytes.push(b'\n'),
+                    Some('t') => bytes.push(b'\t'),
+                    Some(other) => {
+                        bytes.push(b'\\');
+                        let mut buf = [0u8; 4];
+                        bytes.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+                    }
+                    None => bytes.push(b'\\'),
+                }
+            } else {
+                let mut buf = [0u8; 4];
+                bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        return Some(Value::SliceLit {
+            encoding: SliceEncoding::Text,
+            bytes,
+        });
+    }
+    None
+}
+
 /// Recognise a Tolk struct literal `Type { field: value, ... }` and
 /// return the type name plus a `Vec<(field_name, value_expr)>`.
 ///
@@ -2839,7 +3314,12 @@ fn parse_struct_literal(expr: &str) -> Option<(String, Vec<(String, String)>)> {
     if !expr.ends_with('}') {
         return None;
     }
-    let type_name = expr[..brace_open].trim().to_string();
+    // Strip a generic-instantiation suffix (`Box<int> { ... }` →
+    // `Box`) so the recorder registers the literal under the bare
+    // type name — same convention as the function-name resolver, so
+    // `value_to_record` can look the type id up by the canonical
+    // `Box`/`Pair`/`Status` etc.  See `strip_generic_args`.
+    let type_name = strip_generic_args(expr[..brace_open].trim()).to_string();
     if type_name.is_empty() || !is_simple_identifier(&type_name) {
         return None;
     }
@@ -2877,7 +3357,7 @@ mod tests {
 fun main(): int {
     return compute();
 }"#;
-        let functions = parse_functions(source);
+        let functions = parse_functions(source, Path::new("test.tolk"));
         assert_eq!(functions.len(), 2);
         assert_eq!(functions[0].name, "compute");
         assert_eq!(functions[0].return_type, Some("int".to_string()));
@@ -2988,7 +3468,7 @@ fun main(): int {
 fun main(): int {
     return compute();
 }"#;
-        let functions = parse_functions(source);
+        let functions = parse_functions(source, Path::new("test.tolk"));
         assert_eq!(functions.len(), 2);
 
         // Simulate evaluation of compute() using the real TVM.
