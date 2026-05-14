@@ -215,6 +215,10 @@ enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// Unary bitwise NOT (`~x`).  TVM `NOT` (0xb3) computes
+    /// `-x - 1`, matching Tolk's signed-integer convention for
+    /// bitwise negation.
+    Not(Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,6 +238,12 @@ enum BinOp {
     Gt,
     Leq,
     Geq,
+    // Bitwise operators (TVM logicops): AND/OR/XOR + LSHIFT/RSHIFT.
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 /// Parse a simple expression string into an AST.
@@ -276,6 +286,19 @@ fn parse_expr(expr: &str, known: &HashMap<String, i64>) -> Option<Expr> {
         return Some(Expr::Literal(0));
     }
 
+    // Unary bitwise NOT: `~<expr>`.  Recognised here (after the
+    // paren-balance pre-pass and literal lookups, before binary-op
+    // dispatch) so a top-level `~a` parses as a unary node and never
+    // reaches the binary-op scanners as a single-char operator.
+    if let Some(rest) = expr.strip_prefix('~') {
+        let inner = rest.trim();
+        if !inner.is_empty() {
+            if let Some(inner_ast) = parse_expr(inner, known) {
+                return Some(Expr::Not(Box::new(inner_ast)));
+            }
+        }
+    }
+
     // Try as integer literal.
     if let Ok(val) = expr.parse::<i64>() {
         return Some(Expr::Literal(val));
@@ -286,7 +309,56 @@ fn parse_expr(expr: &str, known: &HashMap<String, i64>) -> Option<Expr> {
         return Some(Expr::Literal(val));
     }
 
-    // Try comparison operators (lowest precedence): ==, !=, <=, >=
+    // Bitwise OR (`|`) — lowest precedence so it binds last.
+    // Right-to-left scan: the rightmost top-level `|` is the
+    // top-level split point.  We avoid swallowing `||` (logical OR)
+    // by checking the neighbouring char; Tolk doesn't currently use
+    // `||` but the explicit guard keeps us forward-compatible.
+    if let Some(pos) = find_top_level_single_bitwise(expr, '|') {
+        let left = expr[..pos].trim();
+        let right = expr[pos + 1..].trim();
+        if !left.is_empty() && !right.is_empty() {
+            let left_ast = parse_expr(left, known)?;
+            let right_ast = parse_expr(right, known)?;
+            return Some(Expr::BinOp {
+                op: BinOp::BitOr,
+                left: Box::new(left_ast),
+                right: Box::new(right_ast),
+            });
+        }
+    }
+
+    // Bitwise XOR (`^`).
+    if let Some(pos) = find_top_level_single_bitwise(expr, '^') {
+        let left = expr[..pos].trim();
+        let right = expr[pos + 1..].trim();
+        if !left.is_empty() && !right.is_empty() {
+            let left_ast = parse_expr(left, known)?;
+            let right_ast = parse_expr(right, known)?;
+            return Some(Expr::BinOp {
+                op: BinOp::BitXor,
+                left: Box::new(left_ast),
+                right: Box::new(right_ast),
+            });
+        }
+    }
+
+    // Bitwise AND (`&`).  Same logical-AND-style guard against `&&`.
+    if let Some(pos) = find_top_level_single_bitwise(expr, '&') {
+        let left = expr[..pos].trim();
+        let right = expr[pos + 1..].trim();
+        if !left.is_empty() && !right.is_empty() {
+            let left_ast = parse_expr(left, known)?;
+            let right_ast = parse_expr(right, known)?;
+            return Some(Expr::BinOp {
+                op: BinOp::BitAnd,
+                left: Box::new(left_ast),
+                right: Box::new(right_ast),
+            });
+        }
+    }
+
+    // Try comparison operators (lower precedence than shifts): ==, !=, <=, >=
     for (op_str, op) in &[
         ("==", BinOp::Eq),
         ("!=", BinOp::Neq),
@@ -308,7 +380,25 @@ fn parse_expr(expr: &str, known: &HashMap<String, i64>) -> Option<Expr> {
         }
     }
 
-    // Single-char < and > (after checking <=, >=).
+    // Bitwise shifts (`<<`, `>>`) — checked BEFORE single-char `<` /
+    // `>` so a top-level `<<` doesn't get split as a comparison.
+    for (op_str, op) in &[("<<", BinOp::Shl), (">>", BinOp::Shr)] {
+        if let Some(pos) = find_top_level_op(expr, op_str) {
+            let left = expr[..pos].trim();
+            let right = expr[pos + op_str.len()..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                let left_ast = parse_expr(left, known)?;
+                let right_ast = parse_expr(right, known)?;
+                return Some(Expr::BinOp {
+                    op: *op,
+                    left: Box::new(left_ast),
+                    right: Box::new(right_ast),
+                });
+            }
+        }
+    }
+
+    // Single-char < and > (after checking <=, >=, <<, >>).
     for (op_str, op) in &[("<", BinOp::Lt), (">", BinOp::Gt)] {
         if let Some(pos) = find_top_level_single_comparison(expr, op_str) {
             let left = expr[..pos].trim();
@@ -397,6 +487,13 @@ fn compile_ast(expr: &Expr, program: &mut TvmProgram) {
         Expr::Literal(n) => {
             program.push_int(*n);
         }
+        Expr::Not(inner) => {
+            // TVM NOT (`b3`): pops x, pushes -x - 1 (the canonical
+            // signed-integer bitwise complement).  Matches Tolk's
+            // semantics for `~a` on an `int` operand.
+            compile_ast(inner, program);
+            program.bytes.push(0xb3);
+        }
         Expr::BinOp { op, left, right } => {
             // Push operands in order (left first, then right).
             compile_ast(left, program);
@@ -439,6 +536,31 @@ fn compile_ast(expr: &Expr, program: &mut TvmProgram) {
                     // GEQ: 0xbe
                     program.bytes.push(0xbe);
                 }
+                // Bitwise binary ops (TVM `logicops`): AND/OR/XOR
+                // are single-byte opcodes; the variable-shift forms
+                // pop `count` then `x` and push the shifted result.
+                BinOp::BitAnd => {
+                    // AND: 0xb0
+                    program.bytes.push(0xb0);
+                }
+                BinOp::BitOr => {
+                    // OR: 0xb1
+                    program.bytes.push(0xb1);
+                }
+                BinOp::BitXor => {
+                    // XOR: 0xb2
+                    program.bytes.push(0xb2);
+                }
+                BinOp::Shl => {
+                    // LSHIFT (var): 0xac — pops y (count) and x,
+                    // pushes x << y.
+                    program.bytes.push(0xac);
+                }
+                BinOp::Shr => {
+                    // RSHIFT (var): 0xad — pops y (count) and x,
+                    // pushes x >> y (arithmetic shift).
+                    program.bytes.push(0xad);
+                }
             }
             // For comparison operators, TVM returns -1 (true) or 0 (false).
             // Our tests expect 1 for true. We need to negate the result.
@@ -476,6 +598,37 @@ fn find_top_level_op(expr: &str, op: &str) -> Option<usize> {
             _ => {}
         }
         if depth == 0 && i > 0 && chars[i..i + op_chars.len()] == op_chars[..] {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Find a single-character bitwise operator (`&`, `|`, `^`) at top
+/// level, scanning right-to-left for the lowest-precedence binding.
+/// Skips occurrences that are part of doubled operators (`&&`, `||`)
+/// — Tolk doesn't currently use those, but the explicit guard keeps
+/// the bitwise scanners forward-compatible with logical-operator
+/// support arriving via a parser fast-path.
+fn find_top_level_single_bitwise(expr: &str, op_char: char) -> Option<usize> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut depth = 0i32;
+    for i in (0..chars.len()).rev() {
+        match chars[i] {
+            ')' => depth += 1,
+            '(' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && i > 0 && chars[i] == op_char {
+            // Skip doubled (`&&` / `||`) and the carat-doubled (`^^`)
+            // shapes — none of these are real Tolk operators today,
+            // but the guard is cheap and keeps the scanner robust.
+            if i + 1 < chars.len() && chars[i + 1] == op_char {
+                continue;
+            }
+            if chars[i - 1] == op_char {
+                continue;
+            }
             return Some(i);
         }
     }

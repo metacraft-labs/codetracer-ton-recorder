@@ -41,6 +41,13 @@ struct FunctionDef {
     body: Vec<Statement>,
     /// 1-based line number where the function definition starts.
     line: u32,
+    /// `@method_id(N)` value when the function carries one, otherwise
+    /// `None`.  Real-world Tolk contracts attach `@method_id` to
+    /// every getter so the on-chain dispatch table can route requests
+    /// by method id; the recorder preserves it on the function entry
+    /// so future channels (calltrace metadata, frontend filters) can
+    /// surface it without re-parsing the source.
+    method_id: Option<i64>,
 }
 
 /// A parsed statement in a Tolk function body.
@@ -261,6 +268,13 @@ pub struct TolkTracer {
     /// been written yet (the recorder still synthesises an empty
     /// `Cell` on read so downstream code doesn't blow up).
     storage_data: Option<Value>,
+    /// Set of struct names that participate in a `type X = A | B | C;`
+    /// union declaration.  When one of these names appears as a
+    /// constructor (`Pending { ... }`, `Active { n: 7 }`), the value
+    /// is emitted as `ValueRecord::Variant` with the name as the
+    /// discriminator instead of as a plain `ValueRecord::Struct`.
+    /// Pre-populated by `parse_variant_constructors` at trace start.
+    variant_constructors: std::collections::HashSet<String>,
 }
 
 impl TolkTracer {
@@ -284,6 +298,7 @@ impl TolkTracer {
             writer: create_trace_writer(&program_str, &[], CTFS_FORMAT),
             type_ids: HashMap::new(),
             storage_data: None,
+            variant_constructors: parse_variant_constructors(source_code),
         };
 
         // -- 3. Initialise output files --
@@ -529,9 +544,26 @@ impl TolkTracer {
                     self.type_ids.insert(type_name.clone(), id);
                     id
                 };
-                ValueRecord::Struct {
+                // If `type_name` was registered as a variant
+                // constructor (via a `type X = A | B | C;` union
+                // declaration scanned at trace start), wrap the
+                // struct contents in a `ValueRecord::Variant` whose
+                // discriminator carries the constructor name.  The
+                // contents `Struct { ... }` round-trips the field
+                // tuple unchanged so the downstream consumer sees
+                // both the variant tag AND the per-constructor data.
+                let struct_record = ValueRecord::Struct {
                     field_values,
                     type_id,
+                };
+                if self.variant_constructors.contains(type_name) {
+                    ValueRecord::Variant {
+                        discriminator: type_name.clone(),
+                        contents: Box::new(struct_record),
+                        type_id,
+                    }
+                } else {
+                    struct_record
                 }
             }
             // TON Builder / Cell / Slice surface as `ValueRecord::Raw`
@@ -1524,7 +1556,66 @@ impl TolkTracer {
                         refs: Vec::new(),
                     }));
                 }
-                _ => return Ok(None),
+                _ => {
+                    // Fall through to user-defined method dispatch.  A
+                    // method-receiver helper is registered under the
+                    // qualified name `<Type>.<method>`; we resolve the
+                    // base's struct type and look up the qualified
+                    // name in `func_map`.  When the base is not a
+                    // struct (or the qualified name isn't registered),
+                    // this returns Ok(None) so the caller's resolver
+                    // chain continues.
+                    if let Value::Struct { type_name, .. } = &base {
+                        let qualified = format!("{type_name}.{method}");
+                        if let Some(callee) = func_map.get(qualified.as_str()) {
+                            let callee = (*callee).clone();
+                            // Build the actuals: receiver first, then
+                            // the parsed positional args.
+                            let mut arg_vals: Vec<Value> =
+                                Vec::with_capacity(arg_strs.len() + 1);
+                            arg_vals.push(base.clone());
+                            let mut all_args_ok = true;
+                            for (i, a) in arg_strs.iter().enumerate() {
+                                match arg_value_records
+                                    .get(i)
+                                    .cloned()
+                                    .flatten()
+                                {
+                                    Some(v) => arg_vals.push(v),
+                                    None => {
+                                        // Re-evaluate (the first pass
+                                        // is best-effort and may have
+                                        // returned None for a
+                                        // non-int-flat shape).
+                                        match self.eval_expr_to_value(
+                                            a, env, source_path, func_map,
+                                        )? {
+                                            Some(v) => arg_vals.push(v),
+                                            None => {
+                                                all_args_ok = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if all_args_ok {
+                                let mut dummy_env: HashMap<String, Value> =
+                                    HashMap::new();
+                                let result = self.evaluate_function(
+                                    source_path,
+                                    &callee,
+                                    func_map,
+                                    &mut dummy_env,
+                                    false,
+                                    &arg_vals,
+                                )?;
+                                return Ok(result);
+                            }
+                        }
+                    }
+                    return Ok(None);
+                }
             }
         }
 
@@ -1678,10 +1769,51 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
     let mut functions = Vec::new();
     let lines: Vec<&str> = source.lines().collect();
     let mut i = 0;
+    // Pending attribute decorators that have been seen but not yet
+    // attached to a `fun` declaration.  Tolk uses `@method_id(N)`,
+    // `@inline`, `@inline_ref`, `@pure` (and a handful of others) on
+    // the line(s) preceding a `fun` line.  Today we recognise
+    // `@method_id(N)` specifically and fold N onto the next function
+    // declaration; every other attribute is skipped silently so the
+    // function still parses normally.  Multiple consecutive attribute
+    // lines stack — the canonical TON style is one attribute per line.
+    let mut pending_method_id: Option<i64> = None;
 
     while i < lines.len() {
         let trimmed = lines[i].trim();
         let line_num = (i + 1) as u32;
+
+        // Function-attribute lines.  Each `@<name>` (with optional
+        // `(<args>)`) is recognised and the parser advances; the
+        // attribute may carry a `@method_id(N)` payload that we
+        // capture for the next-declared function.  Trailing junk
+        // beyond the closing paren (rare) is tolerated — the line is
+        // still consumed.
+        if trimmed.starts_with('@') {
+            if let Some(name_and_args) = trimmed.strip_prefix('@') {
+                if let Some(paren_open) = name_and_args.find('(') {
+                    let name = name_and_args[..paren_open].trim();
+                    if name == "method_id" {
+                        if let Some(paren_close) =
+                            name_and_args[paren_open + 1..].find(')')
+                        {
+                            let arg = name_and_args
+                                [paren_open + 1..paren_open + 1 + paren_close]
+                                .trim();
+                            if let Ok(n) = arg.parse::<i64>() {
+                                pending_method_id = Some(n);
+                            }
+                        }
+                    }
+                }
+                // Any other `@attr` (including `@inline`, `@pure`,
+                // `@inline_ref`) is acknowledged and skipped — the
+                // recorder doesn't care about inlining decisions, only
+                // that the next `fun` line is still recognised.
+            }
+            i += 1;
+            continue;
+        }
 
         // Check for function definition: `fun <name>(...)`
         let after_keyword = if let Some(rest) = trimmed.strip_prefix("fun ") {
@@ -1691,12 +1823,25 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
             continue;
         };
 
+        // Method-receiver syntax: `fun (self <Type>) <name>(<params>): ...`.
+        // The leading `(self <Type>)` is split off and the function is
+        // registered under the qualified name `<Type>.<name>` so call
+        // sites like `bag.length()` resolve via the receiver's type.
+        // The `self` identifier is added as the first formal so the
+        // body sees `self.field` accesses against the caller's struct.
+        let (receiver_type, after_receiver) = parse_receiver_prefix(after_keyword);
+        let after_keyword = after_receiver;
+
         // Parse function name.
         let name_end = after_keyword.find('(').unwrap_or(after_keyword.len());
-        let name = after_keyword[..name_end].trim().to_string();
+        let bare_name = after_keyword[..name_end].trim().to_string();
+        let name = match &receiver_type {
+            Some(t) => format!("{t}.{bare_name}"),
+            None => bare_name,
+        };
 
         // Parse parameters.
-        let params = if let Some(paren_start) = after_keyword.find('(') {
+        let mut params = if let Some(paren_start) = after_keyword.find('(') {
             if let Some(paren_end) = after_keyword.find(')') {
                 let params_str = &after_keyword[paren_start + 1..paren_end];
                 parse_param_list(params_str)
@@ -1706,6 +1851,12 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
         } else {
             vec![]
         };
+        // Prepend `self` as the implicit first formal for receiver
+        // methods so the call-site resolver can pass the LHS through
+        // unchanged.
+        if let Some(rt) = &receiver_type {
+            params.insert(0, ("self".to_string(), rt.clone()));
+        }
 
         // Parse return type: look for ): <type> {
         let return_type = if let Some(paren_end) = after_keyword.find(')') {
@@ -1739,7 +1890,12 @@ fn parse_functions(source: &str) -> Vec<FunctionDef> {
                 params,
                 body,
                 line: line_num,
+                method_id: pending_method_id.take(),
             });
+        } else {
+            // No name resolved — drop any pending attribute so the
+            // next valid declaration starts clean.
+            pending_method_id = None;
         }
 
         i = body_end + 1;
@@ -1857,12 +2013,87 @@ fn parse_block(lines: &[&str], start: usize) -> (Vec<Statement>, usize) {
         }
 
         // Fall back to statement parsing for non-block lines.
+        // Multi-line literal support: if the trimmed line opens a
+        // bracket pair (`(`, `[`, `{`) that is not closed on the same
+        // line, join successive lines until the brackets balance.  This
+        // lets `var p: Point = Point {\n    x: 3,\n    y: 4\n};` parse
+        // as a single VarBinding whose RHS is the equivalent
+        // single-line struct literal.  We only consume continuation
+        // lines (no `}`-only lines that would close an enclosing
+        // block); the join stops at the line whose net depth returns to
+        // zero.
+        let (joined, lines_consumed) = gather_logical_line(lines, idx);
+        if lines_consumed > 1 {
+            if let Some(stmt) = parse_statement(&joined, line_num) {
+                body.push(stmt);
+            }
+            idx += lines_consumed;
+            continue;
+        }
         if let Some(stmt) = parse_statement(trimmed, line_num) {
             body.push(stmt);
         }
         idx += 1;
     }
     (body, idx)
+}
+
+/// Track bracket depth across a starting line and return the joined
+/// text plus the number of source lines consumed.  Returns
+/// `(<single-line>, 1)` when the starting line's bracket depth is
+/// already balanced (the common case); otherwise keeps appending
+/// successive lines until the running depth returns to zero (or we
+/// hit a line that would CLOSE a higher-level block — `}` at depth 0
+/// — in which case we stop early to avoid swallowing the enclosing
+/// block).
+///
+/// Used by `parse_block` to support multi-line struct / tuple
+/// literals (`Point {\n    x: 3,\n    y: 4\n};` and
+/// `(\n    a,\n    b,\n    c\n)`) that the strict
+/// `parse_statement` path would otherwise reject as unclosed
+/// expressions.
+fn gather_logical_line(lines: &[&str], start: usize) -> (String, usize) {
+    let first = lines[start].trim();
+    let depth = bracket_depth(first);
+    if depth == 0 {
+        return (first.to_string(), 1);
+    }
+    let mut joined = first.to_string();
+    let mut running = depth;
+    let mut consumed = 1usize;
+    let mut i = start + 1;
+    while i < lines.len() && running != 0 {
+        let next = lines[i].trim();
+        // Don't swallow an enclosing block's closing brace.  A standalone
+        // `}` at the start of a line drops the running depth by 1; we
+        // only follow it if our current literal is still unbalanced
+        // (running > 0), which is exactly the multi-line literal case.
+        joined.push(' ');
+        joined.push_str(next);
+        running += bracket_depth(next);
+        consumed += 1;
+        i += 1;
+        if running == 0 {
+            break;
+        }
+    }
+    (joined, consumed)
+}
+
+/// Net bracket-depth change across a single line, counting `(`, `[`,
+/// and `{` as +1 and the matching closers as -1.  Strings and comments
+/// are NOT special-cased — the recorder's source corpus is small and
+/// hand-written, so the simpler accounting is sufficient.
+fn bracket_depth(line: &str) -> i32 {
+    let mut d = 0i32;
+    for &b in line.as_bytes() {
+        match b {
+            b'(' | b'[' | b'{' => d += 1,
+            b')' | b']' | b'}' => d -= 1,
+            _ => {}
+        }
+    }
+    d
 }
 
 /// Parse zero or more `else` / `else if` clauses that may follow an
@@ -1996,6 +2227,81 @@ fn strip_paren_block_header(rest: &str) -> Option<String> {
         return None;
     }
     Some(cond)
+}
+
+/// Scan a Tolk source for `type X = A | B | C;` union declarations
+/// and return the set of right-hand-side variant names.  Each name
+/// is treated as a variant constructor by the value-emission path:
+/// when a constructor with one of these names appears (e.g.
+/// `Active { n: 7 }`), the recorder emits `ValueRecord::Variant`
+/// instead of `ValueRecord::Struct`.  Whitespace inside the union
+/// body is normalised; trailing semicolons are tolerated.  Names
+/// must be simple identifiers (Tolk's variant tags are constructor
+/// names, not parameterised types).
+fn parse_variant_constructors(source: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for raw in source.lines() {
+        let line = raw.trim();
+        let after_type = match line.strip_prefix("type ") {
+            Some(s) => s,
+            None => continue,
+        };
+        let eq_pos = match after_type.find('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        let rhs = after_type[eq_pos + 1..]
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        for part in rhs.split('|') {
+            let name = part.trim();
+            // Tolk allows `Active(int)` style payload signatures in
+            // the union; we strip everything past the first `(`.
+            let name = name.split('(').next().unwrap_or(name).trim();
+            if !name.is_empty() && is_simple_identifier(name) {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Recognise an optional `(self <Type>)` receiver prefix on a `fun `
+/// declaration tail.  Returns `(<Type>, <rest-after-receiver>)` when
+/// the prefix matches, or `(None, <unchanged-tail>)` when the
+/// declaration doesn't carry one.  Tolk's exact source-level shape is
+/// `fun (self Bag) length(): int { ... }` — the parser consumes the
+/// `(self Bag) ` segment so the downstream "find name + params"
+/// pipeline sees the conventional `length(): int { ... }` tail.
+fn parse_receiver_prefix(rest: &str) -> (Option<String>, &str) {
+    let rest = rest.trim_start();
+    let inner_start = match rest.strip_prefix('(') {
+        Some(s) => s,
+        None => return (None, rest),
+    };
+    let close_pos = match inner_start.find(')') {
+        Some(p) => p,
+        None => return (None, rest),
+    };
+    let inner = inner_start[..close_pos].trim();
+    let mut parts = inner.split_whitespace();
+    let head = match parts.next() {
+        Some(h) => h,
+        None => return (None, rest),
+    };
+    if head != "self" {
+        return (None, rest);
+    }
+    let type_name = match parts.next() {
+        Some(t) => t.to_string(),
+        None => return (None, rest),
+    };
+    if parts.next().is_some() {
+        return (None, rest);
+    }
+    let after = inner_start[close_pos + 1..].trim_start();
+    (Some(type_name), after)
 }
 
 /// Parse a parameter list string like "a: int, b: int" into (name, type) pairs.
