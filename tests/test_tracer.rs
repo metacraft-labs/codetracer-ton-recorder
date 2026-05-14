@@ -2063,6 +2063,686 @@ fn test_builder_refs_test_via_ct_print_full() {
     assert_eq!(returns[3]["return_value"]["i"].as_i64(), Some(52267));
 }
 
+// --- multiline_struct_test.tolk --------------------------------------------
+
+/// Records `multiline_struct_test.tolk` and pins the recorder's
+/// multi-line struct- and tuple-literal parsing.  The hand-rolled
+/// parser was strictly line-oriented prior to this fixture; a
+/// `Point { x: 3, y: 4 }` literal that fit on one line parsed but the
+/// same value split across `Point {`, `    x: 3,`, `    y: 4`, `};`
+/// did not.  The fixture contains exactly two such multi-line
+/// literals — a struct and a tuple — and the test asserts that both
+/// surface as the SAME `ValueRecord::Struct` / `ValueRecord::Tuple`
+/// shapes that the equivalent single-line literals in
+/// `tuples_structs_test.tolk` produce.
+#[test]
+fn test_multiline_struct_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_multiline_struct_test_via_ct_print_full",
+        "multiline_struct_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "make_point", "make_triple"],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(15), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 15 steps + 3 call_entry + 3 call_exit = 21 events.
+    assert_eq!(events.len(), 21, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "make_point".to_string(),
+            "make_triple".to_string(),
+        ],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "make_point".to_string(),
+            "make_triple".to_string(),
+            "compute".to_string(),
+        ],
+    );
+
+    // ----- Structured variable shapes ---------------------------------
+    // Every (varname, value.kind) pair in source-emission order.  The
+    // multi-line struct (`p`) MUST surface as a Struct — not as a
+    // bare Int that swallowed the literal — and the multi-line tuple
+    // (`t`) MUST surface as a Tuple.
+    let var_sequence: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("value.kind").to_string(),
+                    )
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_sequence,
+        vec![
+            // make_point: multi-line struct literal.
+            ("p".into(), "Struct".into()),
+            ("sq".into(), "Int".into()),
+            // back in compute: pt = make_point().
+            ("pt".into(), "Int".into()),
+            // make_triple: multi-line tuple literal.
+            ("t".into(), "Tuple".into()),
+            ("first".into(), "Int".into()),
+            ("second".into(), "Int".into()),
+            ("third".into(), "Int".into()),
+            ("total".into(), "Int".into()),
+            // back in compute: tr = make_triple(); grand = pt + tr.
+            ("tr".into(), "Int".into()),
+            ("grand".into(), "Int".into()),
+        ],
+    );
+
+    // ----- Spot-check the multi-line struct payload -------------------
+    let p_struct = find_var_value(&doc, "p", "Struct");
+    let fields = p_struct["field_values"]
+        .as_array()
+        .expect("Struct field_values array");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(fields[0]["i"].as_i64(), Some(3));
+    assert_eq!(fields[1]["kind"].as_str(), Some("Int"));
+    assert_eq!(fields[1]["i"].as_i64(), Some(4));
+
+    // ----- Spot-check the multi-line tuple payload --------------------
+    let t_tuple = find_var_value(&doc, "t", "Tuple");
+    let elements = t_tuple["elements"]
+        .as_array()
+        .expect("Tuple elements array");
+    assert_eq!(elements.len(), 3);
+    assert_eq!(elements[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(elements[0]["i"].as_i64(), Some(11));
+    assert_eq!(elements[1]["kind"].as_str(), Some("Int"));
+    assert_eq!(elements[1]["i"].as_i64(), Some(22));
+    assert_eq!(elements[2]["kind"].as_str(), Some("Int"));
+    assert_eq!(elements[2]["i"].as_i64(), Some(33));
+
+    // ----- Return values ----------------------------------------------
+    // make_point -> 25 (3*3 + 4*4); make_triple -> 66 (11+22+33);
+    // compute -> 91 (25+66).
+    let return_values: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            (
+                e["function"].as_str().expect("function").to_string(),
+                rv["i"].as_i64().expect("Int.i"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        return_values,
+        vec![
+            ("make_point".into(), 25),
+            ("make_triple".into(), 66),
+            ("compute".into(), 91),
+        ],
+    );
+}
+
+// --- function_attributes_test.tolk -----------------------------------------
+
+/// Records `function_attributes_test.tolk` and pins the recorder's
+/// handling of Tolk's function-attribute decorators (`@method_id(N)`,
+/// `@inline`, `@inline_ref`, `@pure`).  Real-world TON contracts use
+/// these pervasively; a recorder that drops the decorated helper or
+/// mis-attributes its body is a strict regression.  This test asserts
+/// that all four decorated helpers (`owner_id`, `add`, `store_zero`,
+/// `is_positive`) surface as regular `Function` entries and that
+/// invocation produces the canonical Call/Return event shape.
+#[test]
+fn test_function_attributes_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_function_attributes_test_via_ct_print_full",
+        "function_attributes_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec![
+            "main",
+            "compute",
+            "owner_id",
+            "add",
+            "store_zero",
+            "is_positive",
+        ],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(13), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 13 steps + 5 call_entry + 5 call_exit = 23 events.
+    assert_eq!(events.len(), 23, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "owner_id".to_string(),
+            "add".to_string(),
+            "store_zero".to_string(),
+            "is_positive".to_string(),
+        ],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "owner_id".to_string(),
+            "add".to_string(),
+            "store_zero".to_string(),
+            "is_positive".to_string(),
+            "compute".to_string(),
+        ],
+    );
+
+    // Per-step (varname, i64) trail.  `add(a, b)` and `is_positive(x)`
+    // surface their formal-parameter bindings as regular Int vars
+    // (alongside the locals in compute), so the trail interleaves
+    // arg-binding steps with the caller's let-binding steps.  Final
+    // grand = owner_id() + add(2,3) + store_zero() + is_positive(7)
+    //       = 42         + 5        + 0            + 1
+    //       = 48.
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("oid".into(), 42),
+            ("a".into(), 2),
+            ("b".into(), 3),
+            ("sum".into(), 5),
+            ("zero".into(), 0),
+            ("x".into(), 7),
+            ("pos".into(), 1),
+            ("grand".into(), 48),
+        ],
+    );
+
+    // Return values: owner_id->42, add->5, store_zero->0,
+    // is_positive(7)->1, compute->48.
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            (
+                e["function"].as_str().expect("function").to_string(),
+                rv["i"].as_i64().expect("Int.i"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![
+            ("owner_id".into(), 42),
+            ("add".into(), 5),
+            ("store_zero".into(), 0),
+            ("is_positive".into(), 1),
+            ("compute".into(), 48),
+        ],
+    );
+}
+
+// --- method_receivers_test.tolk --------------------------------------------
+
+/// Records `method_receivers_test.tolk` and pins the recorder's
+/// handling of Tolk's method-receiver syntax: `fun (self T) name()`.
+/// The receiver-bearing helper registers under the qualified name
+/// `T.name` (mirroring Rust's `T::name` and Go's method set), and a
+/// method call `bag.length()` resolves via the receiver's struct
+/// type to the qualified name with the LHS bound to `self` for the
+/// duration of the call.
+#[test]
+fn test_method_receivers_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_method_receivers_test_via_ct_print_full",
+        "method_receivers_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // Method-receiver helpers register under `<Type>.<name>` so the
+    // calltrace pane can disambiguate `Bag.length` from a hypothetical
+    // free-standing `length()`.
+    assert_eq!(
+        functions,
+        vec!["main", "compute", "Bag.length", "Bag.head"],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(9), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(3), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 9 steps + 3 call_entry + 3 call_exit = 15 events.
+    assert_eq!(events.len(), 15, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "Bag.length".to_string(),
+            "Bag.head".to_string(),
+        ],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "Bag.length".to_string(),
+            "Bag.head".to_string(),
+            "compute".to_string(),
+        ],
+    );
+
+    // ----- Per-step (varname, kind) trail -----------------------------
+    // bag is a Struct literal; `self` (the implicit receiver) is bound
+    // as a Struct on entry to each method; n / h / total are scalar
+    // Ints in the caller.
+    let var_sequence: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("value.kind").to_string(),
+                    )
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_sequence,
+        vec![
+            ("bag".into(), "Struct".into()),
+            // Bag.length body — `self` bound to the bag struct.
+            ("self".into(), "Struct".into()),
+            // back in compute: n = bag.length() = 3.
+            ("n".into(), "Int".into()),
+            // Bag.head body — `self` bound again.
+            ("self".into(), "Struct".into()),
+            // back in compute: h = bag.head() = 10.
+            ("h".into(), "Int".into()),
+            // total = n + h = 13.
+            ("total".into(), "Int".into()),
+        ],
+    );
+
+    // ----- bag struct payload -----------------------------------------
+    let bag_struct = find_var_value(&doc, "bag", "Struct");
+    let bag_fields = bag_struct["field_values"]
+        .as_array()
+        .expect("Struct field_values array");
+    assert_eq!(bag_fields.len(), 3);
+    assert_eq!(bag_fields[0]["i"].as_i64(), Some(10));
+    assert_eq!(bag_fields[1]["i"].as_i64(), Some(20));
+    assert_eq!(bag_fields[2]["i"].as_i64(), Some(30));
+
+    // ----- self struct payload (must match `bag` exactly) -------------
+    let self_struct = find_var_value(&doc, "self", "Struct");
+    let self_fields = self_struct["field_values"]
+        .as_array()
+        .expect("Struct field_values array");
+    assert_eq!(self_fields.len(), 3);
+    assert_eq!(self_fields[0]["i"].as_i64(), Some(10));
+    assert_eq!(self_fields[1]["i"].as_i64(), Some(20));
+    assert_eq!(self_fields[2]["i"].as_i64(), Some(30));
+
+    // ----- Return values ----------------------------------------------
+    // Bag.length -> 3 (hard-coded); Bag.head -> 10 (self.a);
+    // compute -> 13 (n + h).
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            (
+                e["function"].as_str().expect("function").to_string(),
+                rv["i"].as_i64().expect("Int.i"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![
+            ("Bag.length".into(), 3),
+            ("Bag.head".into(), 10),
+            ("compute".into(), 13),
+        ],
+    );
+}
+
+// --- variant_constructors_test.tolk ----------------------------------------
+
+/// Records `variant_constructors_test.tolk` and pins the recorder's
+/// variant-constructor handling.  A `type Status = Pending | Active
+/// | Failed;` union declaration registers each name as a variant
+/// constructor; subsequent `Pending { ... }` / `Active { n: 7 }` /
+/// `Failed { reason: 13 }` literals lift to `ValueRecord::Variant`
+/// (with the constructor name as the discriminator and the field
+/// tuple as the contents) instead of a plain `ValueRecord::Struct`.
+/// Each branch helper computes a deterministic int (0, 7, -13) so
+/// the per-variant `result` int and the aggregated `total = -6`
+/// pin both halves of the wire shape strictly.
+#[test]
+fn test_variant_constructors_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_variant_constructors_test_via_ct_print_full",
+        "variant_constructors_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        functions,
+        vec![
+            "main",
+            "compute",
+            "dispatch_pending",
+            "dispatch_active",
+            "dispatch_failed",
+        ],
+    );
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(16), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(4), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 16 steps + 4 call_entry + 4 call_exit = 24 events.
+    assert_eq!(events.len(), 24, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "compute".to_string(),
+            "dispatch_pending".to_string(),
+            "dispatch_active".to_string(),
+            "dispatch_failed".to_string(),
+        ],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "dispatch_pending".to_string(),
+            "dispatch_active".to_string(),
+            "dispatch_failed".to_string(),
+            "compute".to_string(),
+        ],
+    );
+
+    // ----- Per-step (varname, kind) trail -----------------------------
+    let var_sequence: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("value.kind").to_string(),
+                    )
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_sequence,
+        vec![
+            // dispatch_pending body.
+            ("s".into(), "Variant".into()),
+            ("result".into(), "Int".into()),
+            // back in compute: p = dispatch_pending().
+            ("p".into(), "Int".into()),
+            // dispatch_active body.
+            ("s".into(), "Variant".into()),
+            ("result".into(), "Int".into()),
+            // back in compute: a = dispatch_active().
+            ("a".into(), "Int".into()),
+            // dispatch_failed body.
+            ("s".into(), "Variant".into()),
+            ("result".into(), "Int".into()),
+            // back in compute: f = dispatch_failed(); total = p + a + f.
+            ("f".into(), "Int".into()),
+            ("total".into(), "Int".into()),
+        ],
+    );
+
+    // ----- Per-variant discriminator + contents -----------------------
+    // Walk the step events and collect every Variant binding in
+    // emission order, then assert on the discriminator + first-field
+    // payload.
+    let variant_payloads: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["value"]["kind"] == "Variant")
+        .map(|v| {
+            let disc = v["value"]["discriminator"]
+                .as_str()
+                .expect("discriminator")
+                .to_string();
+            let contents = &v["value"]["contents"];
+            assert_eq!(contents["kind"].as_str(), Some("Struct"));
+            let fields = contents["field_values"]
+                .as_array()
+                .expect("contents.field_values");
+            assert_eq!(fields.len(), 1, "{disc} variant must carry exactly one field");
+            assert_eq!(fields[0]["kind"].as_str(), Some("Int"));
+            (disc, fields[0]["i"].as_i64().expect("Int.i"))
+        })
+        .collect();
+    assert_eq!(
+        variant_payloads,
+        vec![
+            ("Pending".into(), 0),
+            ("Active".into(), 7),
+            ("Failed".into(), 13),
+        ],
+    );
+
+    // ----- Return values ----------------------------------------------
+    // dispatch_pending -> 0 (placeholder field); dispatch_active -> 7
+    // (n field); dispatch_failed -> -13 (0 - reason); compute -> -6.
+    let returns: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            (
+                e["function"].as_str().expect("function").to_string(),
+                rv["i"].as_i64().expect("Int.i"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![
+            ("dispatch_pending".into(), 0),
+            ("dispatch_active".into(), 7),
+            ("dispatch_failed".into(), -13),
+            ("compute".into(), -6),
+        ],
+    );
+}
+
+// --- bitwise_ops_test.tolk -------------------------------------------------
+
+/// Records `bitwise_ops_test.tolk` and pins the recorder's bitwise
+/// operator coverage: `&`, `|`, `^`, `~`, `<<`, `>>`.  The TVM
+/// expression pipeline gained `b0`/`b1`/`b2` (AND/OR/XOR), `b3`
+/// (NOT), and `ac`/`ad` (LSHIFT/RSHIFT) opcode emission for these
+/// constructs; this test asserts that each result variable lands as
+/// the canonical TVM-computed integer (signed-wraparound semantics:
+/// `~240 = -241` per the TVM `NOT` definition).  The chained
+/// `combined` expression `(c | d) ^ (e & f)` exercises the
+/// precedence relationship between `|`, `^`, and `&`.
+#[test]
+fn test_bitwise_ops_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_bitwise_ops_test_via_ct_print_full",
+        "bitwise_ops_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "bitwise"]);
+
+    let counts = &doc["counts"];
+    assert_eq!(counts["steps"].as_u64(), Some(12), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 12 steps + 1 call_entry + 1 call_exit = 14 events.
+    assert_eq!(events.len(), 14, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(observed_call_sequence(&doc), vec!["bitwise".to_string()]);
+    assert_eq!(observed_exit_sequence(&doc), vec!["bitwise".to_string()]);
+
+    // Per-variable computed value.  TVM's `NOT` (`~x`) is `-x - 1`
+    // (signed-integer complement); LSHIFT / RSHIFT are
+    // arithmetic-shift left / right; AND / OR / XOR are the obvious
+    // bit-by-bit ops.  The chained `combined = (c | d) ^ (e & f)`
+    // exercises `&` binding tighter than `^` and `|`:
+    //   (0 | 255) ^ (255 & -241)
+    //   = 255 ^ 15
+    //   = 240
+    assert_eq!(
+        observed_int_vars(&doc),
+        vec![
+            ("a".into(), 240),
+            ("b".into(), 15),
+            ("c".into(), 0),       // 240 & 15 = 0
+            ("d".into(), 255),     // 240 | 15 = 255
+            ("e".into(), 255),     // 240 ^ 15 = 255
+            ("f".into(), -241),    // ~240 = -241 (TVM NOT)
+            ("g".into(), 3840),    // 240 << 4 = 3840
+            ("h".into(), 60),      // 240 >> 2 = 60
+            ("combined".into(), 240),
+        ],
+    );
+
+    // Return value: bitwise() returns combined = 240.
+    let returns: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            assert_eq!(rv["kind"].as_str(), Some("Int"));
+            rv["i"].as_i64().expect("Int.i")
+        })
+        .collect();
+    assert_eq!(returns, vec![240]);
+}
+
 // ===========================================================================
 // CLI smoke + env-var tests
 // ===========================================================================
