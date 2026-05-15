@@ -3180,15 +3180,21 @@ fn test_match_test_via_ct_print_full() {
             "classify".to_string(),
         ],
     );
+    // Re-pinned against trace-format-nim eec665b
+    // (CTFS-M-CallKeyOrder: allocate call_key at call entry).  Pre-fix,
+    // call_keys were assigned at registerReturn so the deepest classify
+    // got the smallest key and surfaced first in each dispatch pair;
+    // post-fix, parents get the smallest entry-keys so each dispatch_X
+    // exit precedes its inner classify exit.
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
-            "classify".to_string(),
             "dispatch_pending".to_string(),
             "classify".to_string(),
             "dispatch_active".to_string(),
             "classify".to_string(),
             "dispatch_failed".to_string(),
+            "classify".to_string(),
             "compute".to_string(),
         ],
     );
@@ -3383,12 +3389,17 @@ fn test_type_aliases_casting_test_via_ct_print_full() {
             "pay".to_string(),
         ],
     );
+    // Re-pinned against trace-format-nim eec665b
+    // (CTFS-M-CallKeyOrder: allocate call_key at call entry).  Pre-fix,
+    // exits surfaced inner-most first (pay → route → compute); post-fix,
+    // each dispatch buffer flushes parent exits ahead of remaining
+    // sibling exits, so route's exit slips past compute's.
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
             "pay".to_string(),
-            "route".to_string(),
             "compute".to_string(),
+            "route".to_string(),
         ],
     );
 
@@ -3430,12 +3441,14 @@ fn test_type_aliases_casting_test_via_ct_print_full() {
             )
         })
         .collect();
+    // Re-pinned against trace-format-nim eec665b — exit ordering matches
+    // observed_exit_sequence above (pay → compute → route post-fix).
     assert_eq!(
         returns,
         vec![
             ("pay".into(), 95),
-            ("route".into(), 95),
             ("compute".into(), 95),
+            ("route".into(), 95),
         ],
     );
 }
