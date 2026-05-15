@@ -3567,6 +3567,591 @@ fn test_string_literals_test_via_ct_print_full() {
     );
 }
 
+// --- address_coins_test.tolk ---------------------------------------------
+
+/// Records `address_coins_test.tolk` and pins Tolk's TON-specific
+/// `address` and `coin` domain-type surfaces.  Spec-compliant
+/// recording surfaces:
+///   * `coin` formals (`myBalance: coin`, `msgValue: coin`) lift to
+///     `ValueRecord::Int` with a `coin`-tagged `type_id` distinct
+///     from the generic `int` type_id, so consumers can route on
+///     the type before formatting the value as nanoton / TON;
+///   * `cell` / `slice` formals lift to the existing `Cell` / `Slice`
+///     `ValueRecord::Raw` shapes (the recorder seeds the entry-point
+///     `cell` actual with a payload of `[51966]` so the body's
+///     `loadAddress` can read a meaningful sender hash);
+///   * `var sender: address = sender_slice.loadAddress();` lifts to
+///     a structured `ValueRecord::Struct` carrying two integer fields
+///     (workchain + hash).  This is the M10 deliverable: `address`
+///     surfaces as `Struct{wc, hash}`, NOT as the bare Int the
+///     pre-this-fixture recorder produced.
+#[test]
+fn test_address_coins_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_address_coins_test_via_ct_print_full",
+        "address_coins_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // Function-table population order: `onInternalMessage` is the
+    // entry-point hook (merged into <toplevel> so it doesn't appear
+    // as a regular call) and `handle_message` is its single
+    // delegate.  `onInternalMessage` registers first by virtue of
+    // being the entry-point.
+    assert_eq!(functions, vec!["onInternalMessage", "handle_message"]);
+
+    let counts = &doc["counts"];
+    // Step inventory:
+    //   1 outer pre-line
+    //   1 onInternalMessage(merged)/handle_message param-intro
+    //   3 handle_message body (sender_slice, sender, combined)
+    //   1 onInternalMessage body (processed)
+    //   1 onInternalMessage return-line
+    //   = 7
+    assert_eq!(counts["steps"].as_u64(), Some(7), "steps; counts={counts}");
+    // Single call: `handle_message` (onInternalMessage merges into
+    // <toplevel> via the entry-point arm and does not register a
+    // call).
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 7 steps + 1 call_entry + 1 call_exit = 9 events.
+    assert_eq!(events.len(), 9, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["handle_message".to_string()],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec!["handle_message".to_string()],
+    );
+
+    // ----- call_entry args -----------------------------------------------
+    // Pin the formal-actual binding shape: `coin` formals surface as
+    // tagged Ints (kind == "Int"), `cell`/`slice` formals surface as
+    // their existing Raw envelopes.  Both `coin` formals share the
+    // same `type_id` (the lazily-registered "coin" slot) — distinct
+    // from the generic `int` slot used by ordinary integer locals.
+    let call_entry = events
+        .iter()
+        .find(|e| e["kind"] == "call_entry" && e["function"] == "handle_message")
+        .expect("handle_message call_entry");
+    let args = call_entry["args"].as_array().expect("args array");
+    assert_eq!(args.len(), 4, "handle_message has 4 formals");
+
+    let arg_summary: Vec<(String, String, Option<i64>, Option<String>)> = args
+        .iter()
+        .map(|a| {
+            let name = a["varname"].as_str().expect("varname").to_string();
+            let v = &a["value"];
+            let kind = v["kind"].as_str().expect("kind").to_string();
+            let i = v["i"].as_i64();
+            let r = v["r"].as_str().map(|s| s.to_string());
+            (name, kind, i, r)
+        })
+        .collect();
+    assert_eq!(
+        arg_summary,
+        vec![
+            ("myBalance".into(), "Int".into(), Some(1_000_000_000), None),
+            ("msgValue".into(), "Int".into(), Some(1_000_000_000), None),
+            (
+                "msgFull".into(),
+                "Raw".into(),
+                None,
+                Some("Cell([51966])".into()),
+            ),
+            (
+                "msgBody".into(),
+                "Raw".into(),
+                None,
+                Some("Slice([]) @0/r0".into()),
+            ),
+        ],
+    );
+
+    // The two `coin` formals share a single `type_id`; the `cell`
+    // and `slice` formals carry their own distinct Raw type_ids.
+    // All three of {coin, cell, slice} differ from the generic
+    // `int` slot (type_id 0).
+    let coin_type_id = args[0]["value"]["type_id"].as_u64().expect("coin type_id");
+    let coin_type_id_2 = args[1]["value"]["type_id"]
+        .as_u64()
+        .expect("coin type_id 2");
+    let cell_type_id = args[2]["value"]["type_id"].as_u64().expect("cell type_id");
+    let slice_type_id = args[3]["value"]["type_id"].as_u64().expect("slice type_id");
+    assert_eq!(
+        coin_type_id, coin_type_id_2,
+        "both coin formals share type_id"
+    );
+    assert_ne!(coin_type_id, 0, "coin type_id must differ from generic int");
+    assert_ne!(cell_type_id, slice_type_id, "cell vs slice are distinct");
+    assert_ne!(coin_type_id, cell_type_id, "coin vs cell are distinct");
+    assert_ne!(coin_type_id, slice_type_id, "coin vs slice are distinct");
+
+    // ----- Per-step (varname, kind) trail --------------------------------
+    let var_kinds: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("kind").to_string(),
+                    )
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_kinds,
+        vec![
+            // handle_message param-intro step lists all 4 formals.
+            ("myBalance".into(), "Int".into()),
+            ("msgValue".into(), "Int".into()),
+            ("msgFull".into(), "Raw".into()),
+            ("msgBody".into(), "Raw".into()),
+            // sender_slice: msgFull.beginParse() -> Slice with the
+            // cell's int payload re-cursored.
+            ("sender_slice".into(), "Raw".into()),
+            // sender: loadAddress() lifted to address (Struct{wc,hash}).
+            ("sender".into(), "Struct".into()),
+            // combined: myBalance + msgValue (coin + coin -> Int).
+            ("combined".into(), "Int".into()),
+            // back in onInternalMessage body.
+            ("processed".into(), "Int".into()),
+        ],
+    );
+
+    // ----- Pin the address Struct payload --------------------------------
+    let sender = find_var_value(&doc, "sender", "Struct");
+    let sender_fields = sender["field_values"]
+        .as_array()
+        .expect("Struct field_values");
+    assert_eq!(sender_fields.len(), 2, "address has 2 fields (wc, hash)");
+    // workchain == 0 (the entry-arg synthesiser seeds workchain=0).
+    assert_eq!(sender_fields[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(sender_fields[0]["i"].as_i64(), Some(0));
+    // hash == 51966 (== 0xCAFE, the synthesised cell payload's first
+    // int that `loadAddress` consumes).
+    assert_eq!(sender_fields[1]["kind"].as_str(), Some("Int"));
+    assert_eq!(sender_fields[1]["i"].as_i64(), Some(51966));
+
+    // ----- Pin the sender_slice Raw payload ------------------------------
+    // After beginParse the slice carries the cell's int payload at
+    // cursor position 0.  loadAddress() advances the cursor — but
+    // the binding step records the slice BEFORE the load, so it
+    // must read `Slice([51966]) @0/r0`.
+    let sender_slice_raw: Vec<String> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "sender_slice")
+        .filter_map(|v| v["value"]["r"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert_eq!(sender_slice_raw, vec!["Slice([51966]) @0/r0".to_string()]);
+
+    // ----- combined / processed values -----------------------------------
+    let combined_vals: Vec<i64> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "combined" || v["varname"] == "processed")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(
+        combined_vals,
+        vec![2_000_000_000, 2_000_000_000],
+        "combined = myBalance(1e9) + msgValue(1e9) = 2e9; processed mirrors return"
+    );
+
+    // ----- Return value pin ----------------------------------------------
+    let exit = events
+        .iter()
+        .find(|e| e["kind"] == "call_exit" && e["function"] == "handle_message")
+        .expect("handle_message call_exit");
+    assert_eq!(exit["return_value"]["kind"].as_str(), Some("Int"));
+    assert_eq!(
+        exit["return_value"]["i"].as_i64(),
+        Some(2_000_000_000),
+        "handle_message returns combined"
+    );
+}
+
+// --- tvm_primitives_test.tolk --------------------------------------------
+
+/// Records `tvm_primitives_test.tolk` and pins Tolk's TVM context
+/// primitives backed by continuation register c7: `now()` (block
+/// timestamp), `myBalance()` (contract balance), `msgSender()`
+/// (incoming message origin), `myAddress()` (this contract's
+/// address).  Spec-compliant recording surfaces:
+///   * `now()` -> `Int` (the recorder's deterministic c7 model
+///     returns 1_700_000_000),
+///   * `myBalance()` -> tagged `Int` (`coin` type_id; value
+///     2_000_000_000 = 2 TON in nanoton),
+///   * `msgSender()` -> `Struct{wc, hash}` (`address` shape;
+///     workchain=0, hash=0xCAFE = 51966),
+///   * `myAddress()` -> `Struct{wc, hash}` (`address` shape;
+///     workchain=0, hash=0xBEEF = 48879).
+/// Crucially each value comes from the recorder's TVM-context model
+/// (deterministic but non-zero); a primitive that returned a
+/// zero-default placeholder would be a real recorder regression.
+#[test]
+fn test_tvm_primitives_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_tvm_primitives_test_via_ct_print_full",
+        "tvm_primitives_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(functions, vec!["main", "read_context"]);
+
+    let counts = &doc["counts"];
+    // Step inventory:
+    //   1 outer pre-line
+    //   1 main dispatch step
+    //   read_context: 5 var bindings (ts, bal, sender, here, summary)
+    //                 + 1 return-line step  -- but the return line is
+    //                 *inside* the function body and emits its own
+    //                 step.
+    //   = 1 + 1 + 5 + 1 = 8.
+    assert_eq!(counts["steps"].as_u64(), Some(8), "steps; counts={counts}");
+    assert_eq!(counts["calls"].as_u64(), Some(1), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    let events = doc["events"].as_array().expect("events array");
+    // 8 steps + 1 call_entry + 1 call_exit = 10 events.
+    assert_eq!(events.len(), 10, "events.len()");
+    assert_step_indices_monotonic(&doc);
+
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec!["read_context".to_string()],
+    );
+
+    // ----- Per-step (varname, kind) trail --------------------------------
+    let var_kinds: Vec<(String, String)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| {
+            e["vars"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| {
+                    (
+                        v["varname"].as_str().expect("varname").to_string(),
+                        v["value"]["kind"].as_str().expect("kind").to_string(),
+                    )
+                })
+        })
+        .collect();
+    assert_eq!(
+        var_kinds,
+        vec![
+            ("ts".into(), "Int".into()),
+            ("bal".into(), "Int".into()),
+            ("sender".into(), "Struct".into()),
+            ("here".into(), "Struct".into()),
+            ("summary".into(), "Int".into()),
+        ],
+    );
+
+    // ----- Pin each primitive's deterministic c7 value -------------------
+    let int_vals: Vec<(String, i64)> = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["value"]["kind"].as_str() == Some("Int"))
+        .map(|v| {
+            (
+                v["varname"].as_str().expect("varname").to_string(),
+                v["value"]["i"].as_i64().expect("Int.i"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        int_vals,
+        vec![
+            ("ts".into(), 1_700_000_000),
+            ("bal".into(), 2_000_000_000),
+            // summary = ts + bal = 1.7e9 + 2.0e9 = 3.7e9.
+            ("summary".into(), 3_700_000_000),
+        ],
+    );
+
+    // ----- coin's type_id is distinct from the generic int slot ---------
+    // Pull the coin-tagged value's type_id (from the `bal` binding)
+    // and compare against the int-tagged value's type_id (from `ts`).
+    let ts_type_id = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .find(|v| v["varname"] == "ts")
+        .map(|v| v["value"]["type_id"].as_u64().expect("ts type_id"))
+        .expect("ts var entry");
+    let bal_type_id = events
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .find(|v| v["varname"] == "bal")
+        .map(|v| v["value"]["type_id"].as_u64().expect("bal type_id"))
+        .expect("bal var entry");
+    assert_ne!(
+        ts_type_id, bal_type_id,
+        "coin's value type_id must differ from int's value type_id"
+    );
+
+    // ----- Pin each address Struct's payload -----------------------------
+    // `sender` (msgSender): workchain=0, hash=0xCAFE = 51966.
+    let sender = find_var_value(&doc, "sender", "Struct");
+    let sf = sender["field_values"].as_array().expect("sender fields");
+    assert_eq!(sf.len(), 2, "address has 2 fields (wc, hash)");
+    assert_eq!(sf[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(sf[0]["i"].as_i64(), Some(0));
+    assert_eq!(sf[1]["kind"].as_str(), Some("Int"));
+    assert_eq!(sf[1]["i"].as_i64(), Some(51966));
+
+    // `here` (myAddress): workchain=0, hash=0xBEEF = 48879.
+    let here = find_var_value(&doc, "here", "Struct");
+    let hf = here["field_values"].as_array().expect("here fields");
+    assert_eq!(hf.len(), 2);
+    assert_eq!(hf[0]["kind"].as_str(), Some("Int"));
+    assert_eq!(hf[0]["i"].as_i64(), Some(0));
+    assert_eq!(hf[1]["kind"].as_str(), Some("Int"));
+    assert_eq!(hf[1]["i"].as_i64(), Some(48879));
+
+    // sender and here MUST decode to distinct hashes (they come from
+    // different primitives).
+    assert_ne!(
+        sf[1]["i"].as_i64(),
+        hf[1]["i"].as_i64(),
+        "msgSender and myAddress must yield distinct addresses",
+    );
+
+    // ----- Return value pin ----------------------------------------------
+    let exit = events
+        .iter()
+        .find(|e| e["kind"] == "call_exit" && e["function"] == "read_context")
+        .expect("read_context call_exit");
+    assert_eq!(exit["return_value"]["kind"].as_str(), Some("Int"));
+    assert_eq!(exit["return_value"]["i"].as_i64(), Some(3_700_000_000));
+}
+
+// --- multi_message_dispatch_test.tolk ------------------------------------
+
+/// Records `multi_message_dispatch_test.tolk` and pins the
+/// recorder's multi-message simulation.  Spec-compliant recording:
+///   * recognises the `// @recorder:messages <op0> <op1> ...`
+///     source-level directive and re-invokes `onInternalMessage`
+///     once per op_code (the fixture declares three: 0x01, 0x02,
+///     0x03);
+///   * threads each op_code into the synthesised `msgBody: slice`
+///     so the body's `op = msgBody.loadInt(32)` dispatch routes
+///     through a different branch on each call (`handle_deposit`,
+///     `handle_withdraw`, `handle_query`);
+///   * emits one trace segment per message — the first message
+///     merges into <toplevel> (same constraint as the single-shot
+///     entry-point arm), so its `onInternalMessage` body steps
+///     surface at depth 0; the second and third messages run as
+///     regular non-entry-point calls and open their own
+///     `onInternalMessage` call_entry / call_exit pairs.
+///
+/// The strict pin checks:
+///   * exactly 5 calls (one per branch helper, plus two repeat
+///     `onInternalMessage` entries),
+///   * the per-message `op` binding cycles through `[1, 2, 3]`,
+///   * each branch helper fires exactly once with the matching
+///     op_code as its actual,
+///   * the `onInternalMessage` return value cycles through
+///     `[101, 202, 303]` (one per branch's `<op> + N00`).
+#[test]
+fn test_multi_message_dispatch_test_via_ct_print_full() {
+    let Some((doc, source_path)) = record_and_dump_full(
+        "test_multi_message_dispatch_test_via_ct_print_full",
+        "multi_message_dispatch_test.tolk",
+    ) else {
+        return;
+    };
+
+    assert_metadata_program_ends_with(&doc, &source_path);
+
+    let functions: Vec<&str> = doc["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    // Encounter order: onInternalMessage (entry-point) registers
+    // first, then the three branch helpers in the order their
+    // respective if/else arms are taken across the three messages
+    // (deposit, withdraw, query).
+    assert_eq!(
+        functions,
+        vec![
+            "onInternalMessage",
+            "handle_deposit",
+            "handle_withdraw",
+            "handle_query",
+        ],
+    );
+
+    let counts = &doc["counts"];
+    // Five calls: 3 branch helpers + 2 repeat `onInternalMessage`
+    // entries (msg 1 merges into <toplevel> so only msgs 2 and 3
+    // open a regular call_entry).
+    assert_eq!(counts["calls"].as_u64(), Some(5), "calls; counts={counts}");
+    assert_eq!(
+        counts["io_events"].as_u64(),
+        Some(0),
+        "io_events; counts={counts}"
+    );
+
+    assert_step_indices_monotonic(&doc);
+
+    // ----- call sequence pin --------------------------------------------
+    // First message merges into <toplevel> (no onInternalMessage
+    // call_entry) → branch helper enters at depth 0.  Second and
+    // third messages each open an onInternalMessage call_entry →
+    // branch helper enters as a child.
+    assert_eq!(
+        observed_call_sequence(&doc),
+        vec![
+            "handle_deposit".to_string(),
+            "onInternalMessage".to_string(),
+            "handle_withdraw".to_string(),
+            "onInternalMessage".to_string(),
+            "handle_query".to_string(),
+        ],
+    );
+    assert_eq!(
+        observed_exit_sequence(&doc),
+        vec![
+            "handle_deposit".to_string(),
+            "handle_withdraw".to_string(),
+            "onInternalMessage".to_string(),
+            "handle_query".to_string(),
+            "onInternalMessage".to_string(),
+        ],
+    );
+
+    // ----- per-message op binding pin -----------------------------------
+    // The `op` local binds once per message; across the three
+    // dispatches its value cycles through [1, 2, 3] in source
+    // order.
+    let op_vals: Vec<i64> = doc["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "op")
+        .map(|v| v["value"]["i"].as_i64().expect("op Int.i"))
+        .collect();
+    assert_eq!(op_vals, vec![1, 2, 3], "op cycles through [1, 2, 3]");
+
+    // ----- branch-helper actuals pin ------------------------------------
+    // Each branch helper's `amount` formal binds to the matching
+    // op_code on its single dispatch.  The `amount` step lives
+    // inside the helper's body; we filter by helper-specific
+    // post-arithmetic locals to identify which message-step sequence
+    // it belongs to.
+    let bumped_vals: Vec<i64> = doc["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "bumped")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(bumped_vals, vec![101], "deposit fires once with op=1");
+
+    let penalty_vals: Vec<i64> = doc["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "penalty")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(penalty_vals, vec![202], "withdraw fires once with op=2");
+
+    let marker_vals: Vec<i64> = doc["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "step")
+        .flat_map(|e| e["vars"].as_array().cloned().unwrap_or_default())
+        .filter(|v| v["varname"] == "marker")
+        .map(|v| v["value"]["i"].as_i64().expect("Int.i"))
+        .collect();
+    assert_eq!(marker_vals, vec![303], "query fires once with op=3");
+
+    // ----- per-call_exit return-value cycle -----------------------------
+    // Returns appear in source/exit order.  The branch helpers each
+    // fire once (101 / 202 / 303); the two repeat `onInternalMessage`
+    // exits return the same value as their inner branch.
+    let returns: Vec<(String, i64)> = doc["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "call_exit")
+        .map(|e| {
+            let rv = &e["return_value"];
+            (
+                e["function"].as_str().expect("function").to_string(),
+                rv["i"].as_i64().expect("Int.i"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        returns,
+        vec![
+            ("handle_deposit".into(), 101),
+            ("handle_withdraw".into(), 202),
+            ("onInternalMessage".into(), 202),
+            ("handle_query".into(), 303),
+            ("onInternalMessage".into(), 303),
+        ],
+    );
+}
+
 // ===========================================================================
 // CLI smoke + env-var tests
 // ===========================================================================
