@@ -289,6 +289,29 @@ enum Value {
         encoding: SliceEncoding,
         bytes: Vec<u8>,
     },
+    /// Tolk's `coin` domain type — a tagged Int whose semantic
+    /// distinction from a plain `int` is preserved at the
+    /// `ValueRecord` boundary via a dedicated `coin` `type_id`.
+    /// See `address_coins_test.tolk` and `tvm_primitives_test.tolk`
+    /// for the canonical fixtures: `coin` arises both from formal
+    /// parameter declarations (`fun ...(myBalance: coin, ...)`) and
+    /// from the TVM context primitive `myBalance()`.  The underlying
+    /// `i64` flows through `as_i64` so coin participates in the
+    /// arithmetic pipeline transparently.
+    Coin(i64),
+    /// Tolk's `address` domain type — TON's account address modelled
+    /// as a (workchain, hash) pair.  Surfaces as a structured
+    /// `ValueRecord::Struct` with two named fields so frontend /
+    /// address-decoder consumers can render the pair as
+    /// `<wc>:<hex-hash>`.  Arises from formal parameter declarations
+    /// (`fun ...(sender: address)`), from the TVM context primitives
+    /// `msgSender()` / `myAddress()`, and from `var x: address =
+    /// slice.loadAddress();` annotations that drive the recorder's
+    /// int-to-Address lift.
+    Address {
+        workchain: i64,
+        hash: i64,
+    },
 }
 
 /// Encoding selector for `Value::SliceLit`.  Tolk's source-level
@@ -310,6 +333,10 @@ impl Value {
     fn as_i64(&self) -> Option<i64> {
         match self {
             Value::Int(i) => Some(*i),
+            // `coin` is a tagged Int; it round-trips through the TVM
+            // arithmetic pipeline transparently so `myBalance +
+            // msgValue` (both `coin`) computes a meaningful sum.
+            Value::Coin(i) => Some(*i),
             _ => None,
         }
     }
@@ -339,6 +366,12 @@ pub struct TolkTracer {
     /// discriminator instead of as a plain `ValueRecord::Struct`.
     /// Pre-populated by `parse_variant_constructors` at trace start.
     variant_constructors: std::collections::HashSet<String>,
+    /// Verbatim entry-file source text.  Retained so the recorder
+    /// can scan for source-level directives (currently only the
+    /// `// @recorder:messages ...` multi-message dispatcher hint
+    /// consumed by `evaluate_program`).  See
+    /// `parse_multi_message_directive` for the parser.
+    source_text: Option<String>,
 }
 
 impl TolkTracer {
@@ -390,6 +423,7 @@ impl TolkTracer {
             type_ids: HashMap::new(),
             storage_data: None,
             variant_constructors: variant_ctors,
+            source_text: Some(source_code.to_string()),
         };
 
         // -- 3. Initialise output files --
@@ -565,13 +599,65 @@ impl TolkTracer {
 
         for (idx, name) in present.iter().enumerate() {
             let entry_fn = func_map.get(*name).expect("present-filter");
-            let synthetic_args: Vec<Value> =
-                entry_fn.params.iter().map(|_| Value::Int(0)).collect();
+            // Honour the declared parameter type when synthesising
+            // each actual: `coin` / `address` / `cell` / `slice` lift
+            // to representative TVM-context values so the body's
+            // `loadAddress()` / `loadInt()` / `myBalance + msgValue`
+            // arithmetic can compute meaningful results.  See
+            // `synthesize_entry_arg` for the per-type schedule (and
+            // the per-message override used by the multi-message
+            // dispatcher below).
+            let synthetic_args: Vec<Value> = entry_fn
+                .params
+                .iter()
+                .map(|(_, ty)| synthesize_entry_arg(ty, None))
+                .collect();
             // First entry merges into <toplevel> to keep its body at
             // depth 0 (same constraint as `main()`); any subsequent
             // entry runs as a non-entry-point call so its body opens
             // a fresh call_entry / call_exit pair.
             let is_first = idx == 0;
+
+            // Multi-message dispatcher: opt-in via a source-level
+            // `// @recorder:messages 1 2 3` directive.  When present
+            // (and only on the `onInternalMessage` arm), the recorder
+            // re-invokes the handler once per op_code, threading each
+            // op_code into the synthesised `msgBody: slice` payload
+            // so the body's `msgBody.loadInt(32)` dispatch routes
+            // through a different branch on each call.  Each repeat
+            // runs as a non-entry-point call so its body opens a
+            // fresh call_entry / call_exit pair, producing one trace
+            // segment per op_code.  Without the directive (the
+            // common case) the handler runs once with the default
+            // synthetic args, exactly as before.
+            if *name == "onInternalMessage" {
+                if let Some(op_codes) = parse_multi_message_directive(self.source_text.as_deref()) {
+                    if !op_codes.is_empty() {
+                        for (msg_idx, op) in op_codes.iter().enumerate() {
+                            let args: Vec<Value> = entry_fn
+                                .params
+                                .iter()
+                                .map(|(_, ty)| synthesize_entry_arg(ty, Some(*op)))
+                                .collect();
+                            // First message merges into <toplevel>
+                            // (same constraint as the single-shot
+                            // path); subsequent messages run as
+                            // regular non-entry calls.
+                            let merge_into_toplevel = is_first && msg_idx == 0;
+                            self.evaluate_function(
+                                source_path,
+                                entry_fn,
+                                &func_map,
+                                &mut env,
+                                merge_into_toplevel,
+                                &args,
+                            )?;
+                        }
+                        continue;
+                    }
+                }
+            }
+
             self.evaluate_function(
                 source_path,
                 entry_fn,
@@ -681,6 +767,50 @@ impl TolkTracer {
                 text.push_str(&format!(" @{pos}/r{ref_pos}"));
                 ValueRecord::Raw { r: text, type_id }
             }
+            // Tolk's `coin` domain type — surfaces as a tagged Int.
+            // The integer value flows through unchanged; what changes
+            // vs the plain `Int` arm is the `type_id`, which resolves
+            // to the lazily-registered `coin` slot (`TypeKind::Int`,
+            // separate type_id) so downstream consumers can route on
+            // the type before formatting the value as nanoton / TON.
+            Value::Coin(i) => {
+                let type_id = self.ensure_int_alias_type_id("coin");
+                ValueRecord::Int { i: *i, type_id }
+            }
+            // Tolk's `address` domain type — surfaces as a structured
+            // `ValueRecord::Struct` with two fields (`workchain: int`,
+            // `hash: int`).  The struct type registers lazily under
+            // the canonical name `TolkAddress`; field values use the
+            // generic `int` type_id so they decode as plain integers
+            // on the consumer side.
+            Value::Address { workchain, hash } => {
+                let type_id = if let Some(id) = self.type_ids.get("TolkAddress").copied() {
+                    id
+                } else {
+                    let id = TraceWriter::ensure_type_id(
+                        &mut *self.writer,
+                        TypeKind::Struct,
+                        "TolkAddress",
+                    );
+                    self.type_ids.insert("TolkAddress".to_string(), id);
+                    id
+                };
+                let int_type_id = self.type_ids.get("int").copied().unwrap_or(TypeId(0));
+                let field_values = vec![
+                    ValueRecord::Int {
+                        i: *workchain,
+                        type_id: int_type_id,
+                    },
+                    ValueRecord::Int {
+                        i: *hash,
+                        type_id: int_type_id,
+                    },
+                ];
+                ValueRecord::Struct {
+                    field_values,
+                    type_id,
+                }
+            }
             Value::SliceLit { encoding, bytes } => {
                 // Source-level literal slices register under their
                 // encoding-specific type name so the trace's `type_id`
@@ -727,6 +857,21 @@ impl TolkTracer {
             return id;
         }
         let id = TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::Raw, name);
+        self.type_ids.insert(name.to_string(), id);
+        id
+    }
+
+    /// Lazily register a `TypeKind::Int` slot under a Tolk-specific
+    /// alias name (`coin`, etc.) and return the registered TypeId.
+    /// Distinct from `ensure_raw_type_id` because the underlying
+    /// `TypeKind` differs — alias types carry the same wire shape as
+    /// plain `int` but a different `type_id`, so consumers can route
+    /// on the type before formatting the value.
+    fn ensure_int_alias_type_id(&mut self, name: &str) -> TypeId {
+        if let Some(id) = self.type_ids.get(name).copied() {
+            return id;
+        }
+        let id = TraceWriter::ensure_type_id(&mut *self.writer, TypeKind::Int, name);
         self.type_ids.insert(name.to_string(), id);
         id
     }
@@ -1150,7 +1295,27 @@ impl TolkTracer {
                 // Emit Step event.
                 TraceWriter::register_step(&mut *self.writer, source_path, Line(*line as i64));
 
-                if let Some(val) = self.eval_expr_to_value(expr, env, source_path, func_map)? {
+                if let Some(raw_val) = self.eval_expr_to_value(expr, env, source_path, func_map)? {
+                    // Type-driven lift: when the LHS declares a Tolk
+                    // domain type (`coin`, `address`) and the
+                    // expression evaluated to a plain `Int`, repackage
+                    // the value in the matching `Value::Coin` /
+                    // `Value::Address` variant so the resulting
+                    // `ValueRecord` carries the right type tag (and
+                    // shape, in the address case — `Struct{wc, hash}`).
+                    // The source-level construction surface stays
+                    // unchanged: `var sender: address =
+                    // sender_slice.loadAddress();` just declares the
+                    // intended domain type and the recorder honours it
+                    // here.  See `address_coins_test.tolk`.
+                    let val = match (type_name.as_deref(), &raw_val) {
+                        (Some("address"), Value::Int(i)) => Value::Address {
+                            workchain: 0,
+                            hash: *i,
+                        },
+                        (Some("coin"), Value::Int(i)) => Value::Coin(*i),
+                        _ => raw_val,
+                    };
                     if let Some(int_val) = val.as_i64() {
                         let int_env = value_env_to_i64_map(env);
                         let expr_tracker = stack_tracker::track_expr(expr, &int_env, int_val);
@@ -1434,6 +1599,40 @@ impl TolkTracer {
         // frontend's storage panel doesn't need to know which name
         // the source happens to use.
         if let Some((name, args)) = parse_call_with_args(expr) {
+            // TVM context primitives backed by continuation register
+            // c7.  The TVM whitepaper §5 defines these as
+            // contract-context lookups; pre-this-fixture the
+            // recorder treated them as unknown calls and silently
+            // dropped the binding, so a fixture that exercised
+            // `now()` / `myBalance()` / `msgSender()` / `myAddress()`
+            // produced a degraded trace.  Spec-compliant recording
+            // surfaces each primitive with the matching domain type
+            // (`int` for `now()`, `coin` for `myBalance()`,
+            // `address` for `msgSender()` / `myAddress()`) and
+            // deterministic recorder-side context values so tests
+            // pin both the type tag AND a representative payload.
+            // See `tvm_primitives_test.tolk` for the canonical
+            // fixture.
+            if args.is_empty() {
+                match name {
+                    "now" => return Ok(Some(Value::Int(1_700_000_000))),
+                    "myBalance" => return Ok(Some(Value::Coin(2_000_000_000))),
+                    "msgSender" => {
+                        return Ok(Some(Value::Address {
+                            workchain: 0,
+                            hash: 0xCAFE,
+                        }));
+                    }
+                    "myAddress" => {
+                        return Ok(Some(Value::Address {
+                            workchain: 0,
+                            hash: 0xBEEF,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+
             if name == "beginCell" && args.is_empty() {
                 return Ok(Some(Value::Builder {
                     payload: Vec::new(),
@@ -2637,6 +2836,91 @@ fn parse_receiver_prefix(rest: &str) -> (Option<String>, &str) {
     }
     let after = inner_start[close_pos + 1..].trim_start();
     (Some(type_name), after)
+}
+
+/// Synthesise a representative actual for a contract entry-point
+/// formal parameter, honouring the declared TVM type so the body's
+/// downstream operations (`loadAddress()`, `myBalance + msgValue`,
+/// `msgBody.loadInt(32)`) compute meaningful results instead of
+/// degenerating to zero-default placeholders.
+///
+/// `msg_op_code` is the per-message override threaded by the
+/// multi-message dispatcher (see `evaluate_program`): when present
+/// it becomes the first int payload of the synthesised `msgBody:
+/// slice`, so the body's `op = msgBody.loadInt(32)` dispatch routes
+/// through a different branch on each call.  When absent (the
+/// single-shot path), `slice` synthesises empty.
+///
+/// The exact integer values are recorder-side conventions chosen for
+/// strict-test pinning: `coin = 1_000_000_000` (one TON in nanoton),
+/// `address = (0, 0xBEEF)`, `cell = [0xCAFE]` so `cell.beginParse().
+/// loadAddress()` returns 51966 = 0xCAFE.
+fn synthesize_entry_arg(param_type: &str, msg_op_code: Option<i64>) -> Value {
+    match param_type {
+        "coin" => Value::Coin(1_000_000_000),
+        "address" => Value::Address {
+            workchain: 0,
+            hash: 0xBEEF,
+        },
+        "cell" => Value::Cell {
+            payload: vec![0xCAFE],
+            refs: Vec::new(),
+        },
+        "slice" => {
+            let payload = match msg_op_code {
+                Some(op) => vec![op],
+                None => Vec::new(),
+            };
+            Value::Slice {
+                payload,
+                pos: 0,
+                refs: Vec::new(),
+                ref_pos: 0,
+            }
+        }
+        _ => Value::Int(0),
+    }
+}
+
+/// Parse the optional `// @recorder:messages <int> <int> ...`
+/// directive that opts a fixture into the multi-message dispatcher.
+/// Returns `Some(vec![op0, op1, ...])` when the directive is
+/// present and parses cleanly, `None` otherwise (the single-shot
+/// path).  Each integer literal can be decimal (`1`), hex
+/// (`0x01`), or negative (`-1`).
+///
+/// The directive lives inside the entry-file source text (passed in
+/// verbatim).  Whitespace separates the op codes; commas and
+/// trailing punctuation are tolerated.
+fn parse_multi_message_directive(source: Option<&str>) -> Option<Vec<i64>> {
+    let source = source?;
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let body = trimmed
+            .strip_prefix("//")
+            .or_else(|| trimmed.strip_prefix(";;"))?
+            .trim_start();
+        let body = body.strip_prefix("@recorder:messages")?.trim();
+        let mut codes = Vec::new();
+        for tok in body.split(|c: char| c.is_whitespace() || c == ',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            let parsed =
+                if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+                    i64::from_str_radix(hex, 16).ok()
+                } else {
+                    tok.parse::<i64>().ok()
+                };
+            match parsed {
+                Some(n) => codes.push(n),
+                None => return None,
+            }
+        }
+        return Some(codes);
+    }
+    None
 }
 
 /// Parse a parameter list string like "a: int, b: int" into (name, type) pairs.
