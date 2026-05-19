@@ -306,14 +306,9 @@ pub fn trace_sandbox(vm_log_path: &Path, source_path: &Path, out_dir: &Path) -> 
 
     // CTFS-only writer — events stream lives in `trace.bin`.
     let events_path = out_dir.join("trace.bin");
-    let metadata_path = out_dir.join("trace_metadata.json");
-    let paths_path = out_dir.join("trace_paths.json");
 
     TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
         .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
-        .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).map_err(|e| eyre!("{e}"))?;
 
     TraceWriter::start(&mut *writer, source_path, Line(1));
 
@@ -374,8 +369,9 @@ pub fn trace_sandbox(vm_log_path: &Path, source_path: &Path, out_dir: &Path) -> 
 
     // Finish.
     TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
-    TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
-    TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    writer
+        .write_meta_dat("codetracer-ton-recorder")
+        .map_err(|e| eyre!("{e}"))?;
     writer.close().map_err(|e| eyre!("{e}"))?;
 
     Ok(())

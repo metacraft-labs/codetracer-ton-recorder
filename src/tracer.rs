@@ -432,14 +432,8 @@ impl TolkTracer {
 
         // CTFS-only writer — events stream lives in `trace.bin`.
         let events_path = out_dir.join("trace.bin");
-        let metadata_path = out_dir.join("trace_metadata.json");
-        let paths_path = out_dir.join("trace_paths.json");
 
         TraceWriter::begin_writing_trace_events(&mut *tracer.writer, &events_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_metadata(&mut *tracer.writer, &metadata_path)
-            .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::begin_writing_trace_paths(&mut *tracer.writer, &paths_path)
             .map_err(|e| eyre!("{e}"))?;
 
         // -- 4. Start the trace --
@@ -488,9 +482,9 @@ impl TolkTracer {
 
         // -- 6. Finish writing --
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_metadata(&mut *tracer.writer)
+        tracer.writer
+            .write_meta_dat("codetracer-ton-recorder")
             .map_err(|e| eyre!("{e}"))?;
-        TraceWriter::finish_writing_trace_paths(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
         tracer.writer.close().map_err(|e| eyre!("{e}"))?;
 
         Ok(())
