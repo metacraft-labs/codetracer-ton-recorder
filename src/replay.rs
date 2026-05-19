@@ -201,14 +201,9 @@ pub fn replay_transaction(config: &ReplayConfig, out_dir: &Path) -> Result<()> {
 
     // CTFS-only writer — events stream lives in `trace.bin`.
     let events_path = out_dir.join("trace.bin");
-    let metadata_path = out_dir.join("trace_metadata.json");
-    let paths_path = out_dir.join("trace_paths.json");
 
     TraceWriter::begin_writing_trace_events(&mut *writer, &events_path)
         .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_metadata(&mut *writer, &metadata_path)
-        .map_err(|e| eyre!("{e}"))?;
-    TraceWriter::begin_writing_trace_paths(&mut *writer, &paths_path).map_err(|e| eyre!("{e}"))?;
 
     TraceWriter::start(&mut *writer, source_path, Line(1));
 
@@ -235,8 +230,9 @@ pub fn replay_transaction(config: &ReplayConfig, out_dir: &Path) -> Result<()> {
 
     // -- 4. Finish writing --
     TraceWriter::finish_writing_trace_events(&mut *writer).map_err(|e| eyre!("{e}"))?;
-    TraceWriter::finish_writing_trace_metadata(&mut *writer).map_err(|e| eyre!("{e}"))?;
-    TraceWriter::finish_writing_trace_paths(&mut *writer).map_err(|e| eyre!("{e}"))?;
+    writer
+        .write_meta_dat("codetracer-ton-recorder")
+        .map_err(|e| eyre!("{e}"))?;
     writer.close().map_err(|e| eyre!("{e}"))?;
 
     eprintln!("Replay trace written to {}", out_dir.display());
