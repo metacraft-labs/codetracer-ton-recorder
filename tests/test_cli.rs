@@ -48,7 +48,7 @@ fn ct_print_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("codetracer-trace-format-nim")
-        .join("ct-print")
+        .join(format!("ct-print{}", std::env::consts::EXE_SUFFIX))
 }
 
 // ===========================================================================
