@@ -482,7 +482,8 @@ impl TolkTracer {
 
         // -- 6. Finish writing --
         TraceWriter::finish_writing_trace_events(&mut *tracer.writer).map_err(|e| eyre!("{e}"))?;
-        tracer.writer
+        tracer
+            .writer
             .write_meta_dat("codetracer-ton-recorder")
             .map_err(|e| eyre!("{e}"))?;
         tracer.writer.close().map_err(|e| eyre!("{e}"))?;
