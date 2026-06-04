@@ -1,0 +1,17 @@
+pkgbase = codetracer-ton-recorder
+	pkgdesc = CodeTracer recorder for Tolk / TON smart contract programs
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/metacraft-labs/codetracer-ton-recorder
+	arch = x86_64
+	arch = aarch64
+	license = Apache-2.0
+	makedepends = rust
+	makedepends = cargo
+	depends = glibc
+	depends = zstd
+	provides = codetracer-ton-recorder
+	source = codetracer-ton-recorder-0.1.0.tar.gz::https://github.com/metacraft-labs/codetracer-ton-recorder/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = REPLACE_AT_PUBLISH_TIME_source
+
+pkgname = codetracer-ton-recorder
