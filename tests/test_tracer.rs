@@ -1,3 +1,8 @@
+// Test doc-comments mix prose with bulleted continuations describing
+// expected event streams; clippy::doc_lazy_continuation objects to
+// the indentation but the layout is intentional.
+#![allow(clippy::doc_lazy_continuation)]
+
 //! Integration tests for the Tolk/TON tracer.
 
 use std::path::{Path, PathBuf};
