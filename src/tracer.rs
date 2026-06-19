@@ -59,6 +59,7 @@ struct FunctionDef {
 
 /// A parsed statement in a Tolk function body.
 #[derive(Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
 enum Statement {
     /// `var <name>[: <type>] = <expr>;` or `val <name>[: <type>] = <expr>;`
     ///
@@ -1771,7 +1772,7 @@ impl TolkTracer {
                         pos,
                         refs: sr,
                         ref_pos,
-                    })) = arg_value_records.first().map(|v| v.clone())
+                    })) = arg_value_records.first().cloned()
                     {
                         payload.extend_from_slice(&sp[pos..]);
                         for r in sr.into_iter().skip(ref_pos) {
@@ -2889,33 +2890,35 @@ fn synthesize_entry_arg(param_type: &str, msg_op_code: Option<i64>) -> Value {
 /// trailing punctuation are tolerated.
 fn parse_multi_message_directive(source: Option<&str>) -> Option<Vec<i64>> {
     let source = source?;
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        let body = trimmed
-            .strip_prefix("//")
-            .or_else(|| trimmed.strip_prefix(";;"))?
-            .trim_start();
-        let body = body.strip_prefix("@recorder:messages")?.trim();
-        let mut codes = Vec::new();
-        for tok in body.split(|c: char| c.is_whitespace() || c == ',') {
-            let tok = tok.trim();
-            if tok.is_empty() {
-                continue;
-            }
-            let parsed =
-                if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
-                    i64::from_str_radix(hex, 16).ok()
-                } else {
-                    tok.parse::<i64>().ok()
-                };
-            match parsed {
-                Some(n) => codes.push(n),
-                None => return None,
-            }
+    // The `@recorder:messages` directive lives on the first source
+    // line by convention -- earlier code used a `for line in
+    // source.lines()` loop but the inner `?` short-circuits the
+    // whole function on the first non-matching line, so only line 1
+    // was ever inspected.  Encode that semantic directly.
+    let line = source.lines().next()?;
+    let trimmed = line.trim_start();
+    let body = trimmed
+        .strip_prefix("//")
+        .or_else(|| trimmed.strip_prefix(";;"))?
+        .trim_start();
+    let body = body.strip_prefix("@recorder:messages")?.trim();
+    let mut codes = Vec::new();
+    for tok in body.split(|c: char| c.is_whitespace() || c == ',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
         }
-        return Some(codes);
+        let parsed = if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16).ok()
+        } else {
+            tok.parse::<i64>().ok()
+        };
+        match parsed {
+            Some(n) => codes.push(n),
+            None => return None,
+        }
     }
-    None
+    Some(codes)
 }
 
 /// Parse a parameter list string like "a: int, b: int" into (name, type) pairs.
@@ -3435,8 +3438,8 @@ fn split_top_level_dot(expr: &str) -> Option<(&str, &str)> {
     let bytes = expr.as_bytes();
     let mut depth = 0i32;
     let mut last_dot: Option<usize> = None;
-    for i in 0..bytes.len() {
-        match bytes[i] {
+    for (i, b) in bytes.iter().enumerate() {
+        match *b {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
             b'.' if depth == 0 => last_dot = Some(i),
