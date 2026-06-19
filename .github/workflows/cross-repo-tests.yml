@@ -129,17 +129,14 @@ jobs:
       - name: Clone codetracer
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        # ``--shallow-submodules`` shallow-fetches each direct submodule
-        # but does NOT recurse into nested submodules; the codetracer
-        # nix build later fetches ``libs/NimYAML/test/yaml-test-suite``
-        # (NimYAML's own submodule) and aborts with ``does not appear
-        # to be a git repository`` when it's missing.  Drop
-        # ``--shallow-submodules`` and add an explicit recursive
-        # ``submodule update --init`` so every nested .git/ exists.
         run: |
           CT_REF="${{ steps.resolve-refs.outputs.codetracer_ref }}"
           DEST="$GITHUB_WORKSPACE/../codetracer"
           rm -rf "$DEST"
+          # Clone without submodules first, then init them individually.
+          # --recurse-submodules fails when submodule SHAs are unreachable
+          # (force-pushed or rebased upstream). Individual init+update is
+          # more resilient: we can skip submodules that fail.
           git clone --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/metacraft-labs/codetracer.git" \
             "$DEST"
@@ -151,20 +148,35 @@ jobs:
               -c submodule.recurse=false \
               checkout --no-recurse-submodules FETCH_HEAD
           fi
-          # Initialise every submodule (incl. nested) so the nix build's
-          # internal ``git fetch file://...libs/NimYAML/test/yaml-test-suite``
-          # finds a real repo to read from.  ``|| true`` tolerates the
-          # few submodules whose pinned SHA was force-pushed away.
-          #
-          # ``-c url.<authed>.insteadOf=<unauthed>`` rewrites the
-          # github.com URLs in .gitmodules so private submodules
-          # (e.g. libs/tree-sitter-nim) authenticate via the same
-          # app-token used for the parent clone.  Scoped to this
-          # one invocation so the runner's global config is
-          # untouched.
-          git -C "$DEST" \
-            -c "url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf=https://github.com/" \
-            submodule update --init --recursive --depth 1 || true
+          cd "$DEST"
+          git submodule init
+          # Rewrite submodule URLs with auth token for private repos
+          for url in $(git config --get-regexp '^submodule\..*\.url$' \
+                        | grep -E 'git@github\.com:|https://github\.com/' \
+                        | cut -d' ' -f1); do
+            old_url=$(git config --get "$url")
+            new_url=$(echo "$old_url" \
+              | sed "s|git@github.com:|https://x-access-token:${GH_TOKEN}@github.com/|" \
+              | sed "s|https://github.com/|https://x-access-token:${GH_TOKEN}@github.com/|")
+            git config "$url" "$new_url"
+          done
+          # Update submodules one by one, skipping failures (some pinned
+          # SHAs may be unreachable). The critical submodule for WDIO tests
+          # is tree-sitter-nim; others are optional.
+          # Temporarily disable errexit so failed submodule clones don't
+          # abort the entire step.
+          set +e
+          git config --get-regexp '^submodule\..*\.url$' | cut -d. -f2 | while read -r mod; do
+            echo "Updating submodule: $mod"
+            git \
+              -c "url.https://x-access-token:${GH_TOKEN}@github.com/.insteadOf=https://github.com/" \
+              submodule update --init --recursive --depth 1 -- "$mod" 2>&1
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              echo "::warning::submodule $mod failed to update (rc=$rc, non-fatal)"
+            fi
+          done
+          set -e
 
       - name: Clone codetracer-vscode-extension
         env:
