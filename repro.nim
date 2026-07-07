@@ -7,11 +7,15 @@
 ##
 ## Per ``codetracer-specs/Repo-Requirements.md`` §2.8 the recipe
 ## expresses build and test execution NATIVELY through typed-tool
-## edges (`cargo.build`, `cargo.test`). It does NOT delegate to
-## `shell(command = "bash scripts/...")` wrappers — delegation
-## defeats the engine's incremental-build, action-cache, per-test
-## invalidation, and the CI sharding the engine grows into per
-## ``reprobuild-specs/CI-Sharding.md``.
+## edges (`cargo.build`, `cargo.test`). It does NOT delegate the Rust
+## build / test to `shell(command = "bash scripts/...")` wrappers —
+## delegation defeats the engine's incremental-build, action-cache,
+## per-test invalidation, and the CI sharding the engine grows into per
+## ``reprobuild-specs/CI-Sharding.md``. The ONE ``sh.shell`` edge below
+## wraps the repo's CLI-convention verification script, which is not a
+## cargo target — it is a POSIX-shell assertion harness that ``just
+## test`` runs after ``cargo test`` (see ``Justfile`` ``test:``), so it
+## is modelled as its own execute edge rather than dropped.
 ##
 ## On Windows the recipe drives real reprobuild tool provisioning via
 ## the tarball entries the ``uses:`` packages declare (cargo, rustc,
@@ -24,8 +28,17 @@
 ## TON: test corpus is pre-compiled TVM .boc fixtures.
 
 import repro_project_dsl
+import repro_dsl_stdlib/packages/sh
 
 package codetracer_ton_recorder:
+  # Declare ``path``-mode tool provisioning so the engine adopts it
+  # automatically. The nix dev shell puts cargo / rustc / nim / nimble /
+  # capnp / zstd on PATH (and pkg-config / openssl on Linux/macOS), so
+  # the weak-local PATH resolver is the right default. Without it
+  # ``repro build`` refuses to run with "typed tool provisioning is
+  # required for uses declarations".
+  defaultToolProvisioning "path"
+
   uses:
     # Rust toolchain — declared by version so the tarball-direct
     # provisioning entries in repro_dsl_stdlib/packages/cargo.nim /
@@ -39,7 +52,9 @@ package codetracer_ton_recorder:
     "nim >=2.2 <3.0"
     "nimble"
 
-    # Cap'n Proto schema compiler used by the recorder's build.rs.
+    # Cap'n Proto schema compiler used by the sibling trace-format
+    # crates' build.rs (capnpc over the trace schema) at cargo build
+    # time. The recorder itself has no build.rs.
     "capnp"
 
     # libzstd headers + library, needed when linking the Nim FFI
@@ -52,6 +67,11 @@ package codetracer_ton_recorder:
     when not defined(windows):
       "pkg-config"
       "openssl"
+
+    # POSIX shell — drives the CLI-convention verification edge below,
+    # the same ``bash tests/verify-cli-convention-no-silent-skip.sh``
+    # step ``just test`` runs after ``cargo test``.
+    "sh"
 
   executable codetracerTonRecorder:
     name: "codetracer-ton-recorder"
@@ -77,7 +97,7 @@ package codetracer_ton_recorder:
       actionId = "codetracer-ton-recorder.cargo-build",
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
-        "src", "build.rs"
+        "src"
       ],
       extraOutputs = @[recorderBinary])
     discard collect("default", @[recorderBuild])
@@ -105,7 +125,7 @@ package codetracer_ton_recorder:
       actionId = "codetracer-ton-recorder.cargo-test-build",
       extraInputs = @[
         "Cargo.toml", "Cargo.lock",
-        "src", "build.rs", "tests"
+        "src", "tests"
       ],
       extraOutputs = @["target/debug/deps"])
 
@@ -119,4 +139,31 @@ package codetracer_ton_recorder:
         "target/debug/deps"
       ])
 
-    discard collect("test", @[testsRun.action])
+    # ---- CLI-convention verification edge -----------------------------
+    #
+    # ``just test`` runs ``bash
+    # tests/verify-cli-convention-no-silent-skip.sh`` after ``cargo
+    # test``. The script asserts the recorder's ``--help`` / ``--version``
+    # surface complies with ``Recorder-CLI-Conventions.md`` (no
+    # ``--format`` leak, ``--out-dir`` / ``ct print`` present, the two
+    # ``CODETRACER_TON_RECORDER_*`` env-var fallbacks referenced in
+    # source). It is not a cargo target, so it is modelled as its own
+    # ``sh.shell`` execute edge rather than dropped — reproducing the
+    # repo's full ``just test`` set. The script itself does ``cargo build
+    # --locked --quiet`` (a no-op once the recorder is built), then runs
+    # the freshly-built debug binary via ``cargo run``; ``after`` the
+    # cargo test-build edge guarantees the crate is compiled before the
+    # script runs. Non-cacheable: the script inspects a runtime binary
+    # via automatic monitoring and asserts on ``--help`` text, so it is
+    # re-run every ``repro test`` pass (matching ``just test``).
+    let cliVerify = shell(
+      command = "bash tests/verify-cli-convention-no-silent-skip.sh",
+      actionId = "codetracer-ton-recorder.verify-cli-convention",
+      after = @[testsBuild.action],
+      extraInputs = @[
+        "tests/verify-cli-convention-no-silent-skip.sh",
+        "Cargo.toml", "Cargo.lock", "src"
+      ],
+      cacheable = false)
+
+    discard collect("test", @[testsRun.action, cliVerify])
