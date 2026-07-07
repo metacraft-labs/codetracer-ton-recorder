@@ -3185,21 +3185,20 @@ fn test_match_test_via_ct_print_full() {
             "classify".to_string(),
         ],
     );
-    // Re-pinned against trace-format-nim eec665b
-    // (CTFS-M-CallKeyOrder: allocate call_key at call entry).  Pre-fix,
-    // call_keys were assigned at registerReturn so the deepest classify
-    // got the smallest key and surfaced first in each dispatch pair;
-    // post-fix, parents get the smallest entry-keys so each dispatch_X
-    // exit precedes its inner classify exit.
+    // Re-pinned against trace-format-nim's same-step call_exit LIFO
+    // ordering (ct_print fix 2cd1a10).  Each dispatch_X calls classify,
+    // so classify is the deeper (inner) call and — by LIFO — its exit
+    // precedes its enclosing dispatch_X exit.  compute is the outermost
+    // frame and exits last.
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
+            "classify".to_string(),
             "dispatch_pending".to_string(),
             "classify".to_string(),
             "dispatch_active".to_string(),
             "classify".to_string(),
             "dispatch_failed".to_string(),
-            "classify".to_string(),
             "compute".to_string(),
         ],
     );
@@ -3394,17 +3393,16 @@ fn test_type_aliases_casting_test_via_ct_print_full() {
             "pay".to_string(),
         ],
     );
-    // Re-pinned against trace-format-nim eec665b
-    // (CTFS-M-CallKeyOrder: allocate call_key at call entry).  Pre-fix,
-    // exits surfaced inner-most first (pay → route → compute); post-fix,
-    // each dispatch buffer flushes parent exits ahead of remaining
-    // sibling exits, so route's exit slips past compute's.
+    // Re-pinned against trace-format-nim's same-step call_exit LIFO
+    // ordering (ct_print fix 2cd1a10).  compute calls route, route calls
+    // pay, so the nesting is compute → route → pay and LIFO exits
+    // surface innermost-first: pay, then route, then compute.
     assert_eq!(
         observed_exit_sequence(&doc),
         vec![
             "pay".to_string(),
-            "compute".to_string(),
             "route".to_string(),
+            "compute".to_string(),
         ],
     );
 
@@ -3446,14 +3444,15 @@ fn test_type_aliases_casting_test_via_ct_print_full() {
             )
         })
         .collect();
-    // Re-pinned against trace-format-nim eec665b — exit ordering matches
-    // observed_exit_sequence above (pay → compute → route post-fix).
+    // Same-step call_exit LIFO ordering (ct_print fix 2cd1a10): the
+    // return-value vector follows observed_exit_sequence above —
+    // innermost-first pay → route → compute.
     assert_eq!(
         returns,
         vec![
             ("pay".into(), 95),
-            ("compute".into(), 95),
             ("route".into(), 95),
+            ("compute".into(), 95),
         ],
     );
 }
