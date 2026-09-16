@@ -291,6 +291,13 @@ fn test_recorded_trace_via_ct_print_json() {
     // return-site step).  Stable properties of the canonical fixture —
     // if they change, that's a real regression to investigate, not a
     // flake.
+    //
+    // The second call is `<toplevel>`, the root of the call tree: every
+    // recording opens with it because the writer's `start(path, line)`
+    // registers a `<toplevel>` function and opens its frame at depth 0
+    // before any recorder-emitted event — see `trace-events.md`
+    // §"Recorder Integration — Starting a Recording".  It contributes a
+    // call but no step, so the step count is unaffected by it.
     let counts = &doc["counts"];
     assert_eq!(
         counts["steps"].as_u64(),
@@ -299,13 +306,13 @@ fn test_recorded_trace_via_ct_print_json() {
     );
     assert_eq!(
         counts["calls"].as_u64(),
-        Some(1),
-        "expected 1 call event (compute); counts={counts}",
+        Some(2),
+        "expected 2 call events (<toplevel> + compute); counts={counts}",
     );
 
     let events = doc["events"].as_array().expect("events array");
 
-    // ----- Call sequence: compute (only) ------------------------------
+    // ----- Call sequence: <toplevel> then compute ---------------------
     let call_sequence: Vec<&str> = events
         .iter()
         .filter(|e| e["kind"] == "call_entry")
@@ -313,13 +320,18 @@ fn test_recorded_trace_via_ct_print_json() {
         .collect();
     assert_eq!(
         call_sequence.len(),
-        1,
-        "expected exactly 1 call_entry event; got {:?}",
+        2,
+        "expected exactly 2 call_entry events; got {:?}",
+        call_sequence
+    );
+    assert_eq!(
+        call_sequence[0], "<toplevel>",
+        "expected the root call registered by `start` first; got {:?}",
         call_sequence
     );
     assert!(
-        call_sequence[0].ends_with("compute"),
-        "expected call to be `compute`; got {:?}",
+        call_sequence[1].ends_with("compute"),
+        "expected the second call to be `compute`; got {:?}",
         call_sequence
     );
 
