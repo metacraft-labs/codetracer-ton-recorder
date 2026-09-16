@@ -10,3 +10,6 @@ Cargo.lock
 
 # reprobuild build artifacts
 .repro/
+
+# Local Nix flake input overrides (machine-specific; never committed)
+.env
