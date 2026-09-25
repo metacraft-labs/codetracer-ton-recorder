@@ -28,6 +28,7 @@
 ## TON: test corpus is pre-compiled TVM .boc fixtures.
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
 
 package codetracer_ton_recorder:
@@ -82,6 +83,9 @@ package codetracer_ton_recorder:
     name: "codetracer-ton-recorder"
 
   devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
     activity "default"
 
   build:
