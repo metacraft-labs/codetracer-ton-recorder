@@ -169,7 +169,7 @@ action: SENDRAWMSG mode=3 dst=EQDabc value=100 body=0xdeadbeef
     let events = read_events(&out_dir);
     let event = events
         .iter()
-        .find(|event| event["kind"].as_str() == Some("stderr"))
+        .find(|event| event["kind"].as_str() == Some("EvmEvent"))
         .unwrap_or_else(|| panic!("missing CTFS EvmEvent entry: {events:#?}"));
     let content = string_from_json_byte_array(&event["data"]);
     assert!(
