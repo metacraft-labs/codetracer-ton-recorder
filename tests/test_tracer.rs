@@ -800,7 +800,7 @@ fn test_error_paths_test_via_ct_print_full() {
     );
 
     let events = doc["events"].as_array().expect("events array");
-    // 9 steps + 3 call_entry + 3 call_exit + 2 ioError = 17 events.
+    // 9 steps + 3 call_entry + 3 call_exit + 2 Error = 17 events.
     assert_eq!(events.len(), 17, "events.len()");
     assert_step_indices_monotonic(&doc);
 
@@ -834,18 +834,18 @@ fn test_error_paths_test_via_ct_print_full() {
     // payload that downstream tools (calltrace, event log) render.
     let io_events: Vec<&serde_json::Value> = events
         .iter()
-        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "Error")
         .collect();
-    assert_eq!(io_events.len(), 2, "exactly two ioError events");
+    assert_eq!(io_events.len(), 2, "exactly two Error events");
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("throw 7"),
-        "first ioError text"
+        "first Error text"
     );
     assert_eq!(
         io_events[1]["text"].as_str(),
         Some("assert: code 13"),
-        "second ioError text"
+        "second Error text"
     );
 }
 
@@ -1935,7 +1935,7 @@ fn test_throw_unless_throw_if_test_via_ct_print_full() {
             ("probe_a".into(), 5),
             ("value".into(), 5),
             ("ok_a".into(), 1),
-            // probe_b = 0; guard_amount(0) trips → ioError(40);
+            // probe_b = 0; guard_amount(0) trips → Error(40);
             // ok_b is NOT bound.
             ("probe_b".into(), 0),
             ("value".into(), 0),
@@ -1943,7 +1943,7 @@ fn test_throw_unless_throw_if_test_via_ct_print_full() {
             ("probe_c".into(), 9),
             ("probe".into(), 9),
             ("ok_c".into(), 1),
-            // probe_d = 1; guard_threshold(1) trips → ioError(36);
+            // probe_d = 1; guard_threshold(1) trips → Error(36);
             // ok_d is NOT bound; `total` cannot compute.
             ("probe_d".into(), 1),
             ("probe".into(), 1),
@@ -1955,18 +1955,18 @@ fn test_throw_unless_throw_if_test_via_ct_print_full() {
     // inside guard_threshold(1).
     let io_events: Vec<&serde_json::Value> = events
         .iter()
-        .filter(|e| e["kind"] == "io" && e["io_kind"] == "ioError")
+        .filter(|e| e["kind"] == "io" && e["io_kind"] == "Error")
         .collect();
-    assert_eq!(io_events.len(), 2, "exactly two ioError events");
+    assert_eq!(io_events.len(), 2, "exactly two Error events");
     assert_eq!(
         io_events[0]["text"].as_str(),
         Some("throwIf: code 40"),
-        "first ioError text"
+        "first Error text"
     );
     assert_eq!(
         io_events[1]["text"].as_str(),
         Some("throwUnless: code 36"),
-        "second ioError text"
+        "second Error text"
     );
 
     // Returns: succeeding guards return Int(1); tripping guards
