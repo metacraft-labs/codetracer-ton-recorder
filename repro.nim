@@ -49,16 +49,17 @@ package codetracer_ton_recorder:
     "cargo >=1.85"
     # C compiler driver — rustc links through `cc`, and build scripts
     # (cc-rs, the Nim FFI) compile C. Declaring it puts its directory on
-    # every cargo edge's PATH. Windows links with MSVC instead.
+    # each explicitly bound cargo edge's PATH. Windows links with MSVC instead.
     when defined(linux):
       "gcc"
     elif defined(macosx):
       "clang"
 
     # Nim toolchain — codetracer_trace_writer_nim's build.rs compiles
-    # a static library at cargo build time.
+    # a static library at cargo build time; actions bind these scoped tools.
     "nim >=2.2 <3.0"
     "nimble"
+    "git"
 
     # Cap'n Proto schema compiler used by the sibling trace-format
     # crates' build.rs (capnpc over the trace schema) at cargo build
@@ -80,6 +81,9 @@ package codetracer_ton_recorder:
     # the same ``bash tests/verify-cli-convention-no-silent-skip.sh``
     # step ``just test`` runs after ``cargo test``.
     "sh"
+    "bash"
+    "dirname"
+    "grep"
     # `choco pack` / `choco push` in .github/workflows/publish-chocolatey.yml.
     # Windows-guarded because Chocolatey is a Windows package manager with no
     # POSIX build, so an unguarded entry would fail to resolve on Linux/macOS.
@@ -116,6 +120,14 @@ package codetracer_ton_recorder:
         "src"
       ],
       extraOutputs = @[recorderBinary])
+    for action in [recorderBuild]:
+      appendRegisteredActionToolIdentityRefs(action.id,
+        ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action.id, ["gcc", "pkg-config", "openssl"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action.id, ["clang", "pkg-config", "openssl"])
+
     discard collect("default", @[recorderBuild])
 
     # ---- Test-binary build + run edges (the `test` collection) -------
@@ -155,6 +167,14 @@ package codetracer_ton_recorder:
         "target/debug/deps"
       ])
 
+    for action in [testsBuild.action, testsRun.action]:
+      appendRegisteredActionToolIdentityRefs(action.id,
+        ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action.id, ["gcc", "pkg-config", "openssl"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action.id, ["clang", "pkg-config", "openssl"])
+
     # ---- CLI-convention verification edge -----------------------------
     #
     # ``just test`` runs ``bash
@@ -182,4 +202,10 @@ package codetracer_ton_recorder:
       ],
       cacheable = false)
 
+    appendRegisteredActionToolIdentityRefs(cliVerify.id,
+      ["sh", "bash", "dirname", "grep", "cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+    when defined(linux):
+      appendRegisteredActionToolIdentityRefs(cliVerify.id, ["gcc", "pkg-config", "openssl"])
+    elif defined(macosx):
+      appendRegisteredActionToolIdentityRefs(cliVerify.id, ["clang", "pkg-config", "openssl"])
     discard collect("test", @[testsRun.action, cliVerify])
