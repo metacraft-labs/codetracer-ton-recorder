@@ -46,8 +46,8 @@ package codetracer_ton_recorder:
     # provisioning entries in repro_dsl_stdlib/packages/cargo.nim /
     # rustc.nim / rustfmt.nim resolve on Windows. On Linux/macOS the
     # nix flake supplies the same versions.
-    "rustc >=1.85"
-    "cargo >=1.85"
+    "rustc >=1.88"
+    "cargo >=1.88"
     # C compiler driver — rustc links through `cc`, and build scripts
     # (cc-rs, the Nim FFI) compile C. Declaring it puts its directory on
     # each explicitly bound cargo edge's PATH. Windows links with MSVC instead.

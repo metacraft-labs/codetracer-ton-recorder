@@ -21,6 +21,7 @@ build-decoder:
 test: build-decoder
   CODETRACER_TON_RECORDER_REQUIRE_CT_PRINT=1 cargo test --locked
   bash tests/verify-cli-convention-no-silent-skip.sh
+  bash tests/verify-rust-floor-matches-dependencies.sh
 
 t: test
 
@@ -30,10 +31,14 @@ test-rust:
 verify-cli-convention:
   bash tests/verify-cli-convention-no-silent-skip.sh
 
+verify-rust-floor:
+  bash tests/verify-rust-floor-matches-dependencies.sh
+
 lint:
   cargo fmt --check
   cargo clippy --locked --all-targets -- -D warnings
   bash tests/verify-cli-convention-no-silent-skip.sh
+  bash tests/verify-rust-floor-matches-dependencies.sh
 
 format:
   cargo fmt
