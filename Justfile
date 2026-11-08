@@ -10,8 +10,16 @@ build:
 build-release:
   cargo build --release --locked
 
-test:
-  cargo test --locked
+# Build the ct-print decoder in the sibling codetracer-trace-format-nim checkout, at
+# the fixed path the ct-print-backed tests look for it.
+build-decoder:
+  cd ../codetracer-trace-format-nim && nimble buildCtPrint
+
+# The ct-print-backed tests skip, and a skipped test passes, when ct-print is
+# missing. `test` builds it first and forbids the skip (tests/common/mod.rs), so
+# the shared recorder CI and a local `just test` both assert on the decoded trace.
+test: build-decoder
+  CODETRACER_TON_RECORDER_REQUIRE_CT_PRINT=1 cargo test --locked
   bash tests/verify-cli-convention-no-silent-skip.sh
 
 t: test

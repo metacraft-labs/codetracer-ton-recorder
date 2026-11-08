@@ -5,6 +5,9 @@
 
 //! Integration tests for the Tolk/TON tracer.
 
+mod common;
+
+use common::{ct_print_absent, ct_print_path, ct_print_required};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,21 +15,6 @@ const CTFS_MAGIC: [u8; 5] = [0xC0, 0xDE, 0x72, 0xAC, 0xE2];
 
 fn test_programs_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-programs/tolk")
-}
-
-/// Path to the `ct-print` binary shipped with `codetracer-trace-format-nim`.
-///
-/// The TON recorder is CTFS-only; tests that need to make
-/// content-level assertions on a recorded trace pipe the `.ct`
-/// container through `ct-print --full --strip-paths` and assert on
-/// the resulting JSON.  This is the same workflow that
-/// `Recorder-CLI-Conventions.md` §4 prescribes for downstream tools /
-/// golden snapshots.
-fn ct_print_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("codetracer-trace-format-nim")
-        .join(format!("ct-print{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// Helper: collect every `.ct` file in `out_dir`.
@@ -183,19 +171,14 @@ fn test_ton_function_calls() {
 // * it contributes **no** step — `start` emits the entry step at
 //   `(path, line)` regardless — so step counts are unaffected.
 
-/// Skip-helper: returns `Some(path)` to ct-print or logs a clear
-/// `SKIP:` diagnostic and returns `None`.  The
-/// `verify-cli-convention-no-silent-skip.sh` script greps for the
-/// literal `SKIP:` token, so silent skips remain forbidden.
+/// Skip-helper: returns `Some(path)` to ct-print, or `None` after logging a
+/// `SKIP:` diagnostic. When `CODETRACER_TON_RECORDER_REQUIRE_CT_PRINT=1` (CI)
+/// a missing ct-print panics instead. The
+/// `verify-cli-convention-no-silent-skip.sh` script greps for the literal
+/// `SKIP:` token, so silent skips remain forbidden.
 fn ct_print_or_skip(test_name: &str) -> Option<PathBuf> {
     let p = ct_print_path();
-    if !p.exists() {
-        eprintln!(
-            "SKIP: {test_name} requires ct-print at {} — only available \
-             within the metacraft workspace where codetracer-trace-format-nim \
-             is a sibling.",
-            p.display()
-        );
+    if ct_print_absent(test_name, &p, ct_print_required()) {
         return None;
     }
     Some(p)
