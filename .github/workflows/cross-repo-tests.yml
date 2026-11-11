@@ -157,7 +157,12 @@ jobs:
           # Replace recorder_exec to bypass direnv (which can't propagate
           # GitHub auth to the NixOS Nix daemon) and use --override-input
           # to resolve mcl-blockchain from the local clone.
-          cat > scripts/recorder-shell-exec.sh << HEREDOC
+          #
+          # Append, never overwrite: prepare-tolk-fixture.sh sources this
+          # helper and also calls its recorder_target_dir function. The later
+          # recorder_exec definition below replaces the original one when the
+          # file is sourced, and every other helper function stays defined.
+          cat >> scripts/recorder-shell-exec.sh << HEREDOC
           #!/usr/bin/env bash
           recorder_exec() {
             local repo_dir="\$1"
