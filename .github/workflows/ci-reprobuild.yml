@@ -95,8 +95,20 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
+          # reprobuild v0.2.18 (413830138a) on every leg. Unix legs build that
+          # commit from source and the step below asserts it; Windows x64
+          # installs the v0.2.18 release archive, and Windows arm64, which has
+          # no archive, falls back to a source build of the same commit.
+          # v0.2.18 reads the committed repro.lock schema
+          # (reprobuild.solved-graph-lock.v3); the revisions pinned before
+          # (76659f57 on Unix, codex/attic-ci-cache-vars on Windows) do not.
+          #
+          # Not v0.2.19: it publishes no release archives, and its source
+          # build imports `test_certificates` from a `test-certificates-tools`
+          # checkout that this action does not provision on Windows.
           repro-from-source: ${{ runner.os != 'Windows' && 'true' || 'false' }}
-          repro-build-pin: ${{ runner.os != 'Windows' && '76659f5730ecf698b1963c656494d2cb66eb256d' || 'codex/attic-ci-cache-vars' }}
+          repro-version: v0.2.18
+          repro-build-pin: "413830138a7a73293dfc551d623f7bf2cb0ab62c"
           gh-token: ${{ steps.ci_token.outputs.token }}
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
@@ -108,7 +120,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          test "$(git -C .reprobuild-src rev-parse HEAD)" = 76659f5730ecf698b1963c656494d2cb66eb256d
+          test "$(git -C .reprobuild-src rev-parse HEAD)" = 413830138a7a73293dfc551d623f7bf2cb0ab62c
           test -z "$(git -C .reprobuild-src status --porcelain)"
           test "$(command -v repro)" = "${GITHUB_WORKSPACE}/.reprobuild-src/build/bin/repro"
           test "${REPROBUILD_NIX_DAEMON_BIN}" = "${GITHUB_WORKSPACE}/.reprobuild-src/build/bin/reprobuild-nix-daemon"
@@ -155,7 +167,7 @@ jobs:
           if [ -x /opt/homebrew/bin/bash ]; then
             ln -sf /opt/homebrew/bin/bash "${sandbox}/bin/sh"
           elif command -v nix >/dev/null 2>&1; then
-            nix_bash="$(nix shell --accept-flake-config nixpkgs#bashInteractive --command bash -lc 'command -v bash')"
+            nix_bash="$(nix shell --accept-flake-config --inputs-from "${GITHUB_WORKSPACE}" nixpkgs#bashInteractive --command bash -lc 'command -v bash')"
             ln -sf "${nix_bash}" "${sandbox}/bin/sh"
           else
             echo "No non-SIP bash available for CT_SANDBOX_TOOLS_DIR" >&2
