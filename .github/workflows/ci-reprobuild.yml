@@ -95,21 +95,18 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
-          # reprobuild v0.2.18 (413830138a) on every leg. Unix legs build that
+          # reprobuild v0.2.23 (9dbf4e710d) on every leg. Unix legs build that
           # commit from source and the step below asserts it; Windows x64
-          # installs the v0.2.18 release archive, and Windows arm64, which has
-          # no archive, falls back to a source build of the same commit.
-          # v0.2.18 reads the committed repro.lock schema
-          # (reprobuild.solved-graph-lock.v3); the revisions pinned before
-          # (76659f57 on Unix, codex/attic-ci-cache-vars on Windows) do not.
-          #
-          # Not v0.2.19: it publishes no release archives, and its source
-          # build imports `test_certificates` from a `test-certificates-tools`
-          # checkout that this action does not provision on Windows.
+          # installs the v0.2.23 release archive, and Windows arm64 runs that
+          # x86_64 archive under emulation.
           repro-from-source: ${{ runner.os != 'Windows' && 'true' || 'false' }}
-          repro-version: v0.2.18
-          repro-build-pin: "413830138a7a73293dfc551d623f7bf2cb0ab62c"
+          repro-version: v0.2.23
+          repro-build-pin: "9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0"
           gh-token: ${{ steps.ci_token.outputs.token }}
+          # A job-scoped broker re-mints the Nix GitHub credential while
+          # setup and the build run, so it outlives the token's one hour.
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          app-private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           attic-token: ${{ secrets.ATTIC_TOKEN }}
@@ -120,7 +117,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          test "$(git -C .reprobuild-src rev-parse HEAD)" = 413830138a7a73293dfc551d623f7bf2cb0ab62c
+          test "$(git -C .reprobuild-src rev-parse HEAD)" = 9dbf4e710d7cc0b9a79a4bcd54c931afb6849dd0
           test -z "$(git -C .reprobuild-src status --porcelain)"
           test "$(command -v repro)" = "${GITHUB_WORKSPACE}/.reprobuild-src/build/bin/repro"
           test "${REPROBUILD_NIX_DAEMON_BIN}" = "${GITHUB_WORKSPACE}/.reprobuild-src/build/bin/reprobuild-nix-daemon"
