@@ -30,6 +30,7 @@
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh
+import "../codetracer-trace-format-nim/build_writer_artifacts"
 
 package codetracer_ton_recorder:
   # Declare ``path``-mode tool provisioning so the engine adopts it
@@ -45,8 +46,8 @@ package codetracer_ton_recorder:
     # provisioning entries in repro_dsl_stdlib/packages/cargo.nim /
     # rustc.nim / rustfmt.nim resolve on Windows. On Linux/macOS the
     # nix flake supplies the same versions.
-    "rustc >=1.85"
-    "cargo >=1.85"
+    "rustc >=1.88"
+    "cargo >=1.88"
     # C compiler driver — rustc links through `cc`, and build scripts
     # (cc-rs, the Nim FFI) compile C. Declaring it puts its directory on
     # each explicitly bound cargo edge's PATH. Windows links with MSVC instead.
@@ -69,6 +70,12 @@ package codetracer_ton_recorder:
     # libzstd headers + library, needed when linking the Nim FFI
     # static library into the cargo build.
     "zstd"
+    # zstd.h + libzstd for the sibling ct-print edge
+    # (``build_writer_artifacts.buildCtPrint`` compiles and links against
+    # them; ``zstd`` is the CLI only). The constructor cannot provision a
+    # tool from inside ``build:`` and refuses a recipe that omits it.
+    when not defined(windows):
+      "zstd-dev"
 
     # pkg-config + OpenSSL — openssl-sys consults pkg-config to find
     # OpenSSL on Linux/macOS. The Windows build uses the rustls-tls
@@ -157,15 +164,28 @@ package codetracer_ton_recorder:
       ],
       extraOutputs = @["target/debug/deps"])
 
+    # ct-print is the decoder the ct-print-backed tests run. It is built from
+    # the sibling codetracer-trace-format-nim checkout, and the tests run only
+    # after it exists: without this edge they skip, and a skip passes.
+    # POSIX-only, like the sibling recorders' decoder edge.
+    when not defined(windows):
+      const nimRoot = "../codetracer-trace-format-nim"
+      let decoderBuild = buildCtPrint(nimRoot)
+      let decoderBinary = ctPrintPath(nimRoot)
+
     let testsRun = cargo.test(
       locked = true,
       actionId = "codetracer-ton-recorder.cargo-test-run",
-      after = @[testsBuild.action],
-      extraInputs = @[
-        "Cargo.toml", "Cargo.lock",
-        "src", "tests",
-        "target/debug/deps"
-      ])
+      after = (when not defined(windows): @[testsBuild.action, decoderBuild]
+               else: @[testsBuild.action]),
+      extraInputs = (when not defined(windows):
+        @["Cargo.toml", "Cargo.lock",
+          "src", "tests",
+          "target/debug/deps", decoderBinary]
+        else:
+        @["Cargo.toml", "Cargo.lock",
+          "src", "tests",
+          "target/debug/deps"]))
 
     for action in [testsBuild.action, testsRun.action]:
       appendRegisteredActionToolIdentityRefs(action.id,

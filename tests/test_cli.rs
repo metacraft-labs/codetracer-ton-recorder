@@ -6,8 +6,9 @@
 //! 2. **`ct print` content** — record a fixture and pipe the resulting
 //!    `.ct` container through `ct-print --json` from
 //!    `codetracer-trace-format-nim` to make content-level assertions.
-//!    Skips gracefully when `ct-print` is not present (i.e. when this
-//!    crate is built outside the metacraft workspace).
+//!    Skips with a `SKIP:` line when `ct-print` is absent, unless
+//!    `CODETRACER_TON_RECORDER_REQUIRE_CT_PRINT=1` (set by CI) makes that
+//!    a failure.
 //! 3. **CLI env-var contract** — exercise the post-2026-05-08
 //!    `CODETRACER_TON_RECORDER_OUT_DIR` /
 //!    `CODETRACER_TON_RECORDER_DISABLED` env vars and the
@@ -23,6 +24,9 @@
 //! `--format` contract).  See `AUDIT-CTFS-2026-05.md` ("Convention
 //! compliance follow-up — 2026-05-08") for the full record.
 
+mod common;
+
+use common::{ct_print_absent, ct_print_path, ct_print_required};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -44,20 +48,6 @@ fn cargo_bin() -> Command {
 /// Path to the bundled Tolk fixture used across CLI tests.
 fn flow_test_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-programs/tolk/flow_test.tolk")
-}
-
-/// Path to the `ct-print` binary shipped with `codetracer-trace-format-nim`.
-///
-/// The TON recorder is CTFS-only; tests that need to make content-level
-/// assertions on a recorded trace pipe the `.ct` container through
-/// `ct-print --json` and assert on the resulting JSON.  This is the
-/// same workflow that `Recorder-CLI-Conventions.md` §4 prescribes for
-/// downstream tools / golden snapshots.
-fn ct_print_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("codetracer-trace-format-nim")
-        .join(format!("ct-print{}", std::env::consts::EXE_SUFFIX))
 }
 
 // ===========================================================================
@@ -153,12 +143,11 @@ fn test_record_nonexistent_file() {
 #[test]
 fn test_recorded_trace_via_ct_print_json() {
     let ct_print = ct_print_path();
-    if !ct_print.exists() {
-        eprintln!(
-            "SKIP: ct-print not found at {} — only available within the \
-             metacraft workspace where codetracer-trace-format-nim is a sibling.",
-            ct_print.display()
-        );
+    if ct_print_absent(
+        "test_recorded_trace_via_ct_print_json",
+        &ct_print,
+        ct_print_required(),
+    ) {
         return;
     }
 
